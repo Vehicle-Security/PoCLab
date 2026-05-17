@@ -1,0 +1,38 @@
+#!/bin/sh
+# /etc/init.d/rcS – minimal init for PoC environment
+
+mount -t proc     none /proc
+mount -t sysfs    none /sys
+mount -t devtmpfs none /dev
+mount -t tmpfs    none /tmp
+mount -t tmpfs    none /run
+mount -t debugfs  none /sys/kernel/debug 2>/dev/null || true
+
+# Print kernel version and boot time
+echo ""
+echo "====================================================="
+echo " kernel-poc environment"
+echo " $(uname -r)"
+echo " boot: $(cut -d' ' -f1 /proc/uptime)s"
+echo "====================================================="
+echo ""
+
+# Disable dmesg rate limiting for PoC output visibility
+echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null || true
+
+# Allow unprivileged perf_event_open (required by perf-based exploits)
+echo -1 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true
+
+# Run PoC if present
+if [ -x /root/poc ]; then
+    echo "[*] Running /root/poc as uid=$(id -u) ..."
+    echo "-----------------------------------------------------"
+    /root/poc
+    POC_STATUS=$?
+    echo "-----------------------------------------------------"
+    echo "[*] PoC exited with status $POC_STATUS"
+    echo ""
+fi
+
+# Drop into root shell
+exec setsid /bin/cttyhack setuidgid 0 /bin/sh
