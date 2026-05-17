@@ -46,7 +46,15 @@ make -C "$KERNEL_SRC" O="$KERNEL_BUILD" \
 #   2. kernel-${ARCH}.config (console, interrupt controller, etc.)
 #   3. pocs/<name>/kernel.config (per-PoC requirements, optional)
 MERGE_CONFIGS="$CONFIG_DIR/kernel-common.config $CONFIG_DIR/kernel-${ARCH}.config"
-[ -n "$POC_CONFIG" ] && MERGE_CONFIGS="$MERGE_CONFIGS $POC_CONFIG"
+if [ -n "$POC_CONFIG" ]; then
+    # POC_CONFIG may be relative (passed from pocctl) or absolute (direct make call).
+    # Resolve relative paths against PROJECT_ROOT so this works inside Docker (/work).
+    case "$POC_CONFIG" in
+        /*) POC_CONFIG_ABS="$POC_CONFIG" ;;
+        *)  POC_CONFIG_ABS="$PROJECT_ROOT/$POC_CONFIG" ;;
+    esac
+    MERGE_CONFIGS="$MERGE_CONFIGS $POC_CONFIG_ABS"
+fi
 
 # shellcheck disable=SC2086
 "$KERNEL_SRC/scripts/kconfig/merge_config.sh" \

@@ -67,7 +67,19 @@ chmod +x "$POC_BIN"
 # ── Inject into rootfs ────────────────────────────────────────────────────────
 echo "[*] Injecting poc binary into rootfs ..."
 cp "$POC_BIN" "$ROOTFS_DIR/root/poc"
-chmod +x "$ROOTFS_DIR/root/poc"
+
+# If POC_USER is set, the PoC is a privilege-escalation exploit that must start
+# as a non-root user.  Write the username to poc.user and open up permissions so
+# the non-root user can read and execute the binary from /root/.
+if [ -n "${POC_USER:-}" ]; then
+    echo "[*] LPE mode: PoC will start as user '$POC_USER' (expects to escalate to root)"
+    echo "$POC_USER" > "$ROOTFS_DIR/root/poc.user"
+    chmod 755 "$ROOTFS_DIR/root/poc"   # world-executable
+    chmod 755 "$ROOTFS_DIR/root"       # open /root/ so non-root can enter
+else
+    rm -f "$ROOTFS_DIR/root/poc.user"  # clean up if switching from LPE to root mode
+    chmod 700 "$ROOTFS_DIR/root/poc"
+fi
 
 # ── Repack rootfs.img ─────────────────────────────────────────────────────────
 echo "[*] Repacking rootfs.img ..."

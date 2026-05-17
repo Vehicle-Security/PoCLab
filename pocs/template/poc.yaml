@@ -1,0 +1,32 @@
+apiVersion: poclab/v1
+kind: PoC
+
+metadata:
+  id: your-id              # e.g. CVE-2025-12345  (used by pocctl run <id>)
+  name: Short human name
+  description: One-line description of the vulnerability
+  severity: high           # critical | high | medium | low
+  cve: CVE-XXXX-YYYY       # optional
+  tags: [kernel, lpe]      # adjust as needed
+  references:
+    - https://example.com
+
+target:
+  type: linux-kernel
+  kernel: "6.1.14"                  # pin to the affected version
+  kernel_config: kernel.config      # remove this line if no extra config needed
+
+exploit:
+  source: poc.c                     # path relative to this file
+
+verify:
+  type: log
+  success_pattern: "pwned|root|BUG:|Oops"
+  fail_pattern: "Operation not permitted|EPERM"
+
+runtime:
+  memory: 256M
+  kaslr: "false"    # set to "true" to test KASLR bypass
+  smep: "true"
+  smap: "true"
+  # user: user      # uncomment for LPE PoCs: start as uid=1000, expect root after exploit

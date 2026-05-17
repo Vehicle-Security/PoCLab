@@ -24,10 +24,18 @@ echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null || true
 echo -1 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true
 
 # Run PoC if present
+# If /root/poc.user exists, run as that user (supports LPE PoCs that must start non-root)
 if [ -x /root/poc ]; then
-    echo "[*] Running /root/poc as uid=$(id -u) ..."
-    echo "-----------------------------------------------------"
-    /root/poc
+    if [ -f /root/poc.user ]; then
+        POC_RUN_AS=$(cat /root/poc.user)
+        echo "[*] Running /root/poc as user: $POC_RUN_AS  (LPE: starts non-root, should escalate to root)"
+        echo "-----------------------------------------------------"
+        setuidgid "$POC_RUN_AS" /root/poc
+    else
+        echo "[*] Running /root/poc as uid=$(id -u) ..."
+        echo "-----------------------------------------------------"
+        /root/poc
+    fi
     POC_STATUS=$?
     echo "-----------------------------------------------------"
     echo "[*] PoC exited with status $POC_STATUS"

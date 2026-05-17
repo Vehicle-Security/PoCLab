@@ -37,16 +37,18 @@ KASLR ?= n
 POC_DIR    := $(if $(POC),$(dir $(POC)),)
 POC_CONFIG := $(if $(POC_DIR),$(wildcard $(POC_DIR)kernel.config),)
 
+POC_USER   ?=
+
 export ARCH CROSS_COMPILE QEMU_BIN IMAGE_NAME
 export KERNEL_VERSION BUSYBOX_VERSION JOBS SMEP SMAP KASLR
-export POC_CONFIG
+export POC_CONFIG POC_USER
 
 # ── macOS: build via Docker, run via native QEMU ──────────────────────────────
 DOCKER_IMAGE := kernel-poc-builder
 DOCKER_RUN   := docker run --rm -v "$(shell pwd):/work" -w /work \
                     -e ARCH -e CROSS_COMPILE -e IMAGE_NAME \
                     -e KERNEL_VERSION -e BUSYBOX_VERSION -e JOBS \
-                    -e POC_CONFIG \
+                    -e POC_CONFIG -e POC_USER \
                     $(DOCKER_IMAGE)
 
 ifeq ($(shell uname),Darwin)

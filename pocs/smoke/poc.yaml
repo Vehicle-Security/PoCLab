@@ -1,0 +1,31 @@
+apiVersion: poclab/v1
+kind: PoC
+
+metadata:
+  id: smoke
+  name: Smoke Test
+  description: >
+    End-to-end pipeline validation. Checks 8 environment properties:
+    root uid, uname, /proc/kallsyms (KASLR=n), BPF_MAP_CREATE,
+    CLONE_NEWUSER, debugfs, perf_event_paranoid=-1, printk_ratelimit=0.
+  tags: [smoke, debug]
+
+target:
+  type: linux-kernel
+  arch: arm64        # omit or override: pocctl run smoke ARCH=x86_64
+  kernel: "6.1.14"
+  # no kernel_config needed; all options are in kernel-common.config
+
+exploit:
+  source: poc.c
+
+verify:
+  type: log
+  success_pattern: "All.*checks passed"
+  fail_pattern: "checks passed.*review"
+
+runtime:
+  memory: 256M
+  kaslr: "false"
+  smep: "true"
+  smap: "true"

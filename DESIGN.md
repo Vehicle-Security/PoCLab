@@ -5,15 +5,13 @@
 text
 
 ```text
-poc-lab/
-├── pocs/                  # 每个漏洞/PoC 的定义
-├── runtimes/              # 不同运行环境后端：qemu、docker、vagrant、k8s 等
-├── images/                # 基础镜像/构建脚本
-├── kernels/               # Linux kernel 构建与缓存
-├── services/              # system service / web service 模板
-├── orchestrator/          # 调度器/CLI
-├── schemas/               # PoC 配置 schema
-├── tools/                 # 通用工具
+kernel-poc/
+├── pocs/                  # 每个漏洞/PoC 的定义（含 poc.yaml manifest）
+├── build/                 # 构建脚本、Docker 镜像、基础配置（Phase 1 实现层）
+├── runtime/               # 不同运行环境后端：qemu、docker、vagrant、k8s 等（Phase 2+）
+├── artifacts/             # kernel、rootfs、镜像的本地缓存（当前: out/）
+├── schemas/               # PoC manifest schema（poc.yaml JSON Schema）
+├── cli/                   # pocctl 编排 CLI（Phase 1: shell 脚本）
 └── docs/
 ```
 
@@ -121,6 +119,7 @@ target:
   os: linux | freebsd | windows | generic
   version: "..."
   arch: x86_64
+  kernel_config: kernel.config   # 可选；PoC 目录下的内核配置片段，自动 merge
 
 environment:
   privilege: root | user
@@ -178,7 +177,9 @@ pocctl clean CVE-XXXX-YYYY
 
 你需要支持不同类型漏洞，所以 runtime 后端要插件化。
 
-建议定义一个统一接口：
+> **Phase 1 实现说明**：orchestrator（`pocctl`）在 Phase 1 使用 **shell 脚本**实现，不引入 Python/Go 运行时依赖，直接调用现有的 `make` 构建流水线。Phase 2+ 视复杂度选择 Go（适合单二进制分发）或 Python（库生态丰富）。
+
+建议定义一个统一接口（Phase 2+ 参考）：
 
 python
 
@@ -624,48 +625,77 @@ pocctl
 
 text
 
+**Phase 1 实际目录（当前实现）：**
+
 ```text
-poc-lab/
+kernel-poc/                        ← 实际 repo 根目录
 ├── pocs/
-│   ├── linux-kernel/
-│   │   └── CVE-XXXX-YYYY/
-│   ├── freebsd-kernel/
-│   │   └── CVE-XXXX-ZZZZ/
-│   ├── system-service/
-│   │   └── CVE-XXXX-AAAA/
-│   └── web-service/
-│       └── CVE-XXXX-BBBB/
+│   ├── smoke/                     # 完整流水线 smoke test
+│   │   ├── poc.yaml               # ← Phase 1 新增 manifest
+│   │   ├── poc.c
+│   │   └── Makefile
+│   ├── copyfail/                  # CVE-2026-31431
+│   │   ├── poc.yaml
+│   │   ├── poc.c
+│   │   ├── kernel.config
+│   │   └── Makefile
+│   └── template/                  # 新 PoC 模板
+│       ├── poc.yaml
+│       ├── poc.c
+│       └── Makefile
 │
-├── runtime/
-│   ├── base.py
+├── build/                         # 构建脚本（Phase 1 实现层）
+│   ├── Dockerfile
+│   ├── scripts/
+│   │   ├── build_kernel.sh
+│   │   ├── build_rootfs.sh
+│   │   ├── pack_poc.sh
+│   │   ├── run.sh
+│   │   └── check_deps.sh
+│   ├── config/
+│   │   ├── kernel-common.config
+│   │   ├── kernel-arm64.config
+│   │   ├── kernel-x86_64.config
+│   │   └── busybox.config
+│   └── rootfs/
+│       └── etc/init.d/rcS
+│
+├── out/                           # 构建产物（gitignore）
+│   ├── arm64/Image, vmlinux, rootfs.img
+│   └── x86_64/bzImage, vmlinux, rootfs.img
+│
+├── pocctl                         # ← Phase 1 CLI（shell 脚本）
+├── Makefile
+└── README.md
+```
+
+**Phase 2+ 目标目录（扩展后）：**
+
+```text
+kernel-poc/
+├── pocs/
+│   ├── linux-kernel/CVE-XXXX-YYYY/
+│   ├── freebsd-kernel/CVE-XXXX-ZZZZ/
+│   ├── system-service/CVE-XXXX-AAAA/
+│   └── web-service/CVE-XXXX-BBBB/
+│
+├── runtime/                       # Phase 2+: 插件化 runtime
+│   ├── base.py  (or .go)
 │   ├── qemu.py
 │   ├── docker.py
 │   ├── docker_compose.py
-│   ├── vagrant.py
-│   └── k8s.py
+│   └── vagrant.py
 │
-├── plugins/
-│   ├── linux_kernel/
-│   ├── freebsd_kernel/
-│   ├── system_service/
-│   └── web_service/
-│
-├── artifacts/
+├── artifacts/                     # Phase 2+: 统一 artifact 缓存
 │   ├── kernels/
 │   ├── rootfs/
-│   ├── images/
-│   └── cache/
+│   └── images/
 │
-├── schemas/
+├── schemas/                       # Phase 2+: JSON Schema 校验
 │   ├── poc.schema.json
-│   ├── linux-kernel.schema.json
-│   ├── freebsd-kernel.schema.json
-│   └── web-service.schema.json
+│   └── linux-kernel.schema.json
 │
-├── cli/
-│   └── pocctl.py
-│
-├── examples/
+├── cli/pocctl                     # Phase 2+: 完整 CLI（Go/Python）
 ├── docs/
 └── README.md
 ```
@@ -838,28 +868,29 @@ pocctl run CVE-XXXX-YYYY --keep-on-failure
 
 不要一开始做太复杂。可以按这个顺序落地：
 
-### Phase 1：Linux kernel MVP
+### Phase 1：Linux kernel MVP（当前阶段）
 
-支持：
+支持（已实现 ✅ / 本次新增 🆕）：
 
-- `poc.yaml`
-- QEMU 启动
-- 多 kernel artifact
-- rootfs overlay
-- 上传/编译/运行 PoC
-- console log 收集
-- 简单 verify
+- ✅ QEMU 启动（arm64/x86_64，HVF 加速）
+- ✅ 多 kernel 版本（按需下载、编译、缓存到 `out/`）
+- ✅ initramfs rootfs（busybox 静态链接，每次 repack 保持干净）
+- ✅ 编译/注入/运行 PoC（跨平台 cross-gcc）
+- ✅ per-PoC `kernel.config` 片段自动 merge
+- ✅ GDB 调试模式（vmlinux + `:1234`）
+- 🆕 `poc.yaml` manifest（声明式 PoC 描述）
+- 🆕 `pocctl` CLI（`pocctl run smoke`，shell 脚本实现）
 
-目录：
+> **rootfs 方案**：Phase 1 使用 **initramfs（cpio）**，每次运行自动重建，天然隔离。
+> qcow2 overlay 方案留到 Phase 2+（适用于需要持久化存储的漏洞场景）。
 
-text
+目录（Phase 1 实际）：
 
 ```text
-pocs/
-runtime/qemu.py
-artifacts/kernels/
-artifacts/rootfs/
-pocctl.py
+pocs/<name>/poc.yaml      ← manifest
+build/scripts/            ← QEMU/kernel/rootfs 构建流水线（shell）
+out/<arch>/               ← artifact 缓存（kernel + rootfs）
+pocctl                    ← CLI 入口（shell 脚本）
 ```
 
 ### Phase 2：Docker / web service

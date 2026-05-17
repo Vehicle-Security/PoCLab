@@ -83,7 +83,7 @@ fi
 # ── 4. Populate rootfs directory ─────────────────────────────────────────────
 echo "[*] Building rootfs directory ..."
 rm -rf "$ROOTFS_DIR"
-mkdir -p "$ROOTFS_DIR"/{bin,dev,etc/init.d,lib,lib64,mnt,proc,root,run,sbin,sys,tmp,usr/{bin,sbin}}
+mkdir -p "$ROOTFS_DIR"/{bin,dev,etc/init.d,home/user,lib,lib64,mnt,proc,root,run,sbin,sys,tmp,usr/{bin,sbin}}
 
 # Copy busybox install tree
 cp -a "$BUSYBOX_BUILD/_install/." "$ROOTFS_DIR/"

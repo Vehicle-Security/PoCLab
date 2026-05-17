@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# pocctl – PoC Lab controller  (Phase 1: Linux kernel via QEMU)
+#
+# Usage:
+#   pocctl list                  – list all PoCs with poc.yaml
+#   pocctl run   <id> [K=V ...]  – build + inject + run in QEMU
+#   pocctl debug <id> [K=V ...]  – same, but with GDB server on :1234
+#   pocctl clean [<id>]          – remove build artifacts
+#   pocctl help                  – this message
+#
+# The <id> matches the directory name under pocs/ that contains a poc.yaml.
+# Extra KEY=VALUE pairs are forwarded to make (e.g. ARCH=x86_64 KASLR=y).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+POCS_DIR="$REPO_ROOT/pocs"
+
+# ── YAML field extractor (no yq dependency) ───────────────────────────────────
+# Extracts the VALUE from the first line matching "  <field>: VALUE"
+# Works for simple scalar fields; sufficient for Phase 1 manifest.
+# Note: || true prevents set -o pipefail from aborting when grep finds no match.
+_yaml_get() {
+    local file="$1" field="$2"
+    { grep -E "^\s*${field}\s*:" "$file" 2>/dev/null || true; } | head -1 \
+        | sed 's/^[^:]*:[[:space:]]*//' \
+        | sed 's/[[:space:]]*#.*//' \
+        | tr -d '"' | tr -d "'" \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# ── Find PoC directory by id ──────────────────────────────────────────────────
+_find_poc_dir() {
+    local id="$1"
+    local poc_yaml="$POCS_DIR/$id/poc.yaml"
+    if [ ! -f "$poc_yaml" ]; then
+        echo "[-] PoC '$id' not found (expected $poc_yaml)" >&2
+        echo "    Run 'pocctl list' to see available PoCs." >&2
+        exit 1
+    fi
+    echo "$POCS_DIR/$id"
+}
+
+# ── Build make args from poc.yaml ─────────────────────────────────────────────
+_make_args_from_yaml() {
+    local poc_dir="$1"
+    local poc_yaml="$poc_dir/poc.yaml"
+
+    local target_type kernel arch source kaslr smep smap run_as
+
+    target_type="$(_yaml_get "$poc_yaml" type)"
+    kernel="$(_yaml_get "$poc_yaml" kernel)"
+    arch="$(_yaml_get "$poc_yaml" arch)"
+    source="$(_yaml_get "$poc_yaml" source)"
+    kaslr="$(_yaml_get "$poc_yaml" kaslr)"
+    smep="$(_yaml_get "$poc_yaml" smep)"
+    smap="$(_yaml_get "$poc_yaml" smap)"
+    run_as="$(_yaml_get "$poc_yaml" user)"
+
+    # Phase 1 only supports linux-kernel
+    local effective_type="${target_type:-linux-kernel}"
+    if [ "$effective_type" != "linux-kernel" ]; then
+        echo "[-] target.type '$effective_type' not supported in Phase 1 (only linux-kernel)" >&2
+        exit 1
+    fi
+
+    local poc_c="$poc_dir/${source:-poc.c}"
+    if [ ! -f "$poc_c" ]; then
+        echo "[-] exploit source not found: $poc_c" >&2
+        exit 1
+    fi
+
+    # Emit KEY=VALUE pairs for make; caller captures with $()
+    # Use a path relative to REPO_ROOT so it works both natively and inside Docker
+    # (Docker mounts the repo at /work, so absolute host paths break POC_CONFIG).
+    echo "POC=${poc_c#$REPO_ROOT/}"
+    [ -n "$kernel" ] && echo "KERNEL_VERSION=$kernel"
+    [ -n "$arch"   ] && echo "ARCH=$arch"
+    if [ -n "$kaslr" ]; then
+        [ "$kaslr" = "true" ] && echo "KASLR=y" || echo "KASLR=n"
+    fi
+    if [ -n "$smep" ]; then
+        [ "$smep" = "false" ] && echo "SMEP=n" || echo "SMEP=y"
+    fi
+    if [ -n "$smap" ]; then
+        [ "$smap" = "false" ] && echo "SMAP=n" || echo "SMAP=y"
+    fi
+    [ -n "$run_as" ] && echo "POC_USER=$run_as"
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    printf "%-20s  %-8s  %-8s  %s\n" "ID" "KERNEL" "ARCH" "NAME"
+    printf "%-20s  %-8s  %-8s  %s\n" "--------------------" "--------" "--------" "----"
+    local found=0
+    for poc_yaml in "$POCS_DIR"/*/poc.yaml; do
+        [ -f "$poc_yaml" ] || continue
+        found=1
+        local poc_dir id name kernel arch
+        poc_dir="$(dirname "$poc_yaml")"
+        id="$(_yaml_get "$poc_yaml" id)"
+        name="$(_yaml_get "$poc_yaml" name)"
+        kernel="$(_yaml_get "$poc_yaml" kernel)"
+        arch="$(_yaml_get "$poc_yaml" arch)"
+        id="${id:-$(basename "$poc_dir")}"
+        printf "%-20s  %-8s  %-8s  %s\n" "$id" "${kernel:--}" "${arch:-auto}" "${name:-(unnamed)}"
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "  (none found – add pocs/<name>/poc.yaml)"
+    fi
+}
+
+cmd_run() {
+    local id="$1"; shift
+    local extra_args=("$@")
+
+    local poc_dir
+    poc_dir="$(_find_poc_dir "$id")"
+
+    local poc_yaml="$poc_dir/poc.yaml"
+    local name kernel arch
+    name="$(_yaml_get "$poc_yaml" name)"
+    kernel="$(_yaml_get "$poc_yaml" kernel)"
+    arch="$(_yaml_get "$poc_yaml" arch)"
+
+    local run_as_info
+    run_as_info="$(_yaml_get "$poc_yaml" user)"
+    echo "[pocctl] PoC: $id – ${name:-(unnamed)}"
+    echo "[pocctl] kernel=${kernel:-default}  arch=${arch:-auto}${run_as_info:+  user=$run_as_info (LPE)}"
+    [ "${#extra_args[@]}" -gt 0 ] && echo "[pocctl] extra: ${extra_args[*]}"
+    echo ""
+
+    # Build make argument array from yaml + extra CLI overrides
+    local make_args=()
+    while IFS= read -r arg; do
+        make_args+=("$arg")
+    done < <(_make_args_from_yaml "$poc_dir")
+    # "${arr[@]}" on an empty array is an error under set -u on bash 3.2 (macOS)
+    [ "${#extra_args[@]}" -gt 0 ] && make_args+=("${extra_args[@]}")
+
+    make -C "$REPO_ROOT" poc "${make_args[@]}"
+}
+
+cmd_debug() {
+    local id="$1"; shift
+    local extra_args=("$@")
+
+    local poc_dir
+    poc_dir="$(_find_poc_dir "$id")"
+
+    local poc_yaml="$poc_dir/poc.yaml"
+    local name
+    name="$(_yaml_get "$poc_yaml" name)"
+
+    echo "[pocctl] Debug: $id – ${name:-(unnamed)}  (GDB on :1234)"
+    echo ""
+
+    local make_args=()
+    while IFS= read -r arg; do
+        make_args+=("$arg")
+    done < <(_make_args_from_yaml "$poc_dir")
+    [ "${#extra_args[@]}" -gt 0 ] && make_args+=("${extra_args[@]}")
+
+    make -C "$REPO_ROOT" debug "${make_args[@]}"
+}
+
+cmd_clean() {
+    local id="${1:-}"
+    if [ -z "$id" ]; then
+        echo "[pocctl] Cleaning all artifacts..."
+        make -C "$REPO_ROOT" clean
+        return
+    fi
+
+    local poc_dir
+    poc_dir="$(_find_poc_dir "$id")"
+    local arch
+    arch="$(_yaml_get "$poc_dir/poc.yaml" arch)"
+    echo "[pocctl] Cleaning artifacts for $id (arch=${arch:-auto})..."
+    make -C "$REPO_ROOT" clean ${arch:+ARCH="$arch"}
+}
+
+cmd_help() {
+    cat <<'EOF'
+pocctl – PoC Lab controller  (Phase 1: Linux kernel via QEMU)
+
+Usage:
+  pocctl list                    List all available PoCs (reads poc.yaml)
+  pocctl run   <id> [K=V ...]   Build kernel + rootfs, inject PoC, launch QEMU
+  pocctl debug <id> [K=V ...]   Same as run, but with GDB server on :1234
+  pocctl clean [<id>]            Remove build artifacts (all, or for one arch)
+  pocctl help                    Show this message
+
+Each PoC lives in pocs/<id>/poc.yaml. Fields read by pocctl:
+  target.kernel        – kernel version to build (e.g. "6.1.14")
+  target.arch          – target arch: arm64 | x86_64  (auto-detect if omitted)
+  target.kernel_config – optional kernel config fragment filename
+  exploit.source       – PoC C source file (relative to poc.yaml)
+  runtime.user         – run as this user in QEMU (e.g. "user" for LPE PoCs)
+  runtime.kaslr/smep/smap – security knob overrides
+
+Extra KEY=VALUE pairs on the command line override poc.yaml values, e.g.:
+  pocctl run smoke ARCH=x86_64
+  pocctl run smoke KERNEL_VERSION=5.15.0
+  pocctl run smoke KASLR=y SMEP=n
+
+Examples:
+  pocctl list
+  pocctl run smoke
+  pocctl run copyfail
+  pocctl debug smoke
+  pocctl clean smoke
+EOF
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    list)               cmd_list ;;
+    run)
+        [ -n "${1:-}" ] || { cmd_help; exit 1; }
+        cmd_run "$@"
+        ;;
+    debug)
+        [ -n "${1:-}" ] || { cmd_help; exit 1; }
+        cmd_debug "$@"
+        ;;
+    clean)              cmd_clean "${1:-}" ;;
+    help|-h|--help)     cmd_help ;;
+    *)
+        echo "[-] Unknown command: $CMD"
+        echo ""
+        cmd_help
+        exit 1
+        ;;
+esac
