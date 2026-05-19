@@ -90,12 +90,19 @@ echo "[*] Starting QEMU ($ARCH) ...  KASLR=$KASLR"
 echo "    Press Ctrl-A X to quit QEMU"
 echo ""
 
-exec "$QEMU_BIN" \
-    "${MACHINE_ARGS[@]}" \
-    -kernel "$KERNEL_IMG" \
-    -initrd "$ROOTFS_IMG" \
-    -append "$APPEND" \
-    -m 256M \
-    -nographic \
-    -no-reboot \
-    "${EXTRA_ARGS[@]}"
+QEMU_CMD=(
+    "$QEMU_BIN"
+    "${MACHINE_ARGS[@]}"
+    -kernel "$KERNEL_IMG"
+    -initrd "$ROOTFS_IMG"
+    -append "$APPEND"
+    -m 256M
+    -nographic
+    -no-reboot
+)
+
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+    QEMU_CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+exec "${QEMU_CMD[@]}"

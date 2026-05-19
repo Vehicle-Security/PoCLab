@@ -4,6 +4,9 @@
 mount -t proc     none /proc
 mount -t sysfs    none /sys
 mount -t devtmpfs none /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts -o mode=0620,ptmxmode=0666 2>/dev/null || true
+[ -e /dev/ptmx ] || ln -s pts/ptmx /dev/ptmx
 mount -t tmpfs    none /tmp
 mount -t tmpfs    none /run
 mount -t debugfs  none /sys/kernel/debug 2>/dev/null || true
@@ -23,6 +26,10 @@ echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null || true
 # Allow unprivileged perf_event_open (required by perf-based exploits)
 echo -1 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true
 
+# Allow LPE PoCs that use userfaultfd and kallsyms from uid=1000.
+echo 1 > /proc/sys/vm/unprivileged_userfaultfd 2>/dev/null || true
+echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null || true
+
 # Run PoC if present
 # If /root/poc.user exists, run as that user (supports LPE PoCs that must start non-root)
 if [ -x /root/poc ]; then
@@ -30,7 +37,11 @@ if [ -x /root/poc ]; then
         POC_RUN_AS=$(cat /root/poc.user)
         echo "[*] Running /root/poc as user: $POC_RUN_AS  (LPE: starts non-root, should escalate to root)"
         echo "-----------------------------------------------------"
-        setuidgid "$POC_RUN_AS" /root/poc
+        if [ -x /root/poc-cap-launcher ] && [ -f /root/poc.caps ]; then
+            /root/poc-cap-launcher "$POC_RUN_AS" "$(cat /root/poc.caps)" /root/poc
+        else
+            setuidgid "$POC_RUN_AS" /root/poc
+        fi
     else
         echo "[*] Running /root/poc as uid=$(id -u) ..."
         echo "-----------------------------------------------------"

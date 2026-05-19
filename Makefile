@@ -18,7 +18,11 @@ CROSS_COMPILE ?= aarch64-linux-gnu-
 QEMU_BIN      := qemu-system-aarch64
 IMAGE_NAME    := Image
 else ifeq ($(ARCH),x86_64)
+ifneq ($(HOST_ARCH),x86_64)
+CROSS_COMPILE ?= x86_64-linux-gnu-
+else
 CROSS_COMPILE ?=
+endif
 QEMU_BIN      := qemu-system-x86_64
 IMAGE_NAME    := bzImage
 else
@@ -38,17 +42,18 @@ POC_DIR    := $(if $(POC),$(dir $(POC)),)
 POC_CONFIG := $(if $(POC_DIR),$(wildcard $(POC_DIR)kernel.config),)
 
 POC_USER   ?=
+POC_CAPS   ?=
 
 export ARCH CROSS_COMPILE QEMU_BIN IMAGE_NAME
 export KERNEL_VERSION BUSYBOX_VERSION JOBS SMEP SMAP KASLR
-export POC_CONFIG POC_USER
+export POC_CONFIG POC_USER POC_CAPS
 
 # ── macOS: build via Docker, run via native QEMU ──────────────────────────────
 DOCKER_IMAGE := kernel-poc-builder
 DOCKER_RUN   := docker run --rm -v "$(shell pwd):/work" -w /work \
                     -e ARCH -e CROSS_COMPILE -e IMAGE_NAME \
                     -e KERNEL_VERSION -e BUSYBOX_VERSION -e JOBS \
-                    -e POC_CONFIG -e POC_USER \
+                    -e POC_CONFIG -e POC_USER -e POC_CAPS \
                     $(DOCKER_IMAGE)
 
 ifeq ($(shell uname),Darwin)
