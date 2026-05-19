@@ -97,7 +97,8 @@ QEMU_CMD=(
     -initrd "$ROOTFS_IMG"
     -append "$APPEND"
     -m 256M
-    -nographic
+    -display none
+    -serial mon:stdio
     -no-reboot
 )
 

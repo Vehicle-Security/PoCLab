@@ -54,4 +54,8 @@ if [ -x /root/poc ]; then
 fi
 
 # Drop into root shell
+# Reset the serial line before handing it to the interactive shell.  Some PoCs
+# spawn shells or tweak tty state, and carrying that state into the final console
+# can make QEMU stdio input look like it is dropping or reordering characters.
+stty sane < /dev/console > /dev/console 2>&1 || true
 exec setsid /bin/cttyhack setuidgid 0 /bin/sh
