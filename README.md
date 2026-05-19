@@ -1,48 +1,60 @@
 # kernel-poc
 
-Minimal Linux kernel + QEMU environment for reproducing kernel vulnerability PoCs.
-Supports per-PoC kernel configuration so each exploit runs in the exact kernel
-environment it needs without polluting the shared config.
+Minimal Linux kernel + QEMU environment for reproducing kernel vulnerability
+PoCs. Supports per-PoC manifests and kernel configuration so each exploit runs
+in the exact kernel environment it needs without polluting shared defaults.
 
 ---
 
 ## One-command quick start
 
-### macOS (Apple Silicon / Intel)
+### macOS (Apple Silicon)
 
 ```bash
 # Prerequisites (one-time)
 brew install qemu
 # Docker Desktop must be installed and running
 
-# From a fresh clone – the Docker image is built automatically on first run
-make poc POC=pocs/smoke/poc.c
+# From a fresh clone - list PoCs, then run the smoke test
+./pocctl list
+./pocctl run smoke
 ```
 
-`make poc` handles everything: builds the Docker cross-compilation image
-(first run only), downloads Linux and BusyBox sources, compiles the kernel,
-builds the initramfs, compiles the PoC, and launches QEMU.
+### macOS (Intel) / Linux (x86-64)
 
-### Linux (x86-64)
+The bundled `smoke` manifest currently pins `target.arch: arm64`, so x86-64
+hosts should override the arch on the command line.
 
 ```bash
-# Install dependencies (one-time)
+# macOS prerequisites (one-time)
+brew install qemu
+# Docker Desktop must be installed and running
+
+# Linux dependencies (one-time)
 sudo apt install build-essential gcc flex bison bc cpio wget xz-utils \
     libelf-dev libssl-dev qemu-system-x86 musl-tools gdb
 
 # From a fresh clone
-make poc POC=pocs/smoke/poc.c
+./pocctl list
+./pocctl run smoke ARCH=x86_64
 ```
+
+`pocctl run <id>` reads `pocs/<id>/poc.yaml`, builds the Docker
+cross-compilation image (first run only on macOS), downloads Linux and BusyBox
+sources, compiles the kernel, builds the initramfs, compiles the PoC, injects
+it into the rootfs, and launches QEMU.
 
 ---
 
 ## Available PoCs
 
-| PoC | Description |
-|-----|-------------|
-| `pocs/smoke/poc.c` | **Environment smoke test** – run first to validate the full pipeline. Checks kernel symbols, BPF, namespaces, debugfs, perf settings. |
-| `pocs/copyfail/poc.c` | **CVE-2026-31431** – page-cache write without write permission via authencesn AEAD ESN out-of-bounds write. |
-| `pocs/template/poc.c` | **Skeleton** – copy this to start a new PoC. |
+Use `./pocctl list` to print the PoCs discovered from `pocs/*/poc.yaml`.
+
+| ID | Source | Description |
+|----|--------|-------------|
+| `smoke` | `pocs/smoke/poc.c` | **Environment smoke test** - run first to validate the full pipeline. Checks kernel symbols, BPF, namespaces, debugfs, perf settings. |
+| `copyfail` | `pocs/copyfail/poc.c` | **CVE-2026-31431** - page-cache write without write permission via authencesn AEAD ESN out-of-bounds write. |
+| `template` | `pocs/template/poc.c` | **Skeleton** - copy this to start a new PoC. |
 
 ---
 
@@ -50,7 +62,8 @@ make poc POC=pocs/smoke/poc.c
 
 ```
 kernel-poc/
-├── Makefile                      # main entry point (auto-detects ARCH)
+├── Makefile                      # low-level build entry point
+├── pocctl                        # PoC controller: list/run/debug/clean by id
 ├── build/
 │   ├── Dockerfile                # cross-compilation toolchain image (macOS)
 │   ├── config/
@@ -58,21 +71,26 @@ kernel-poc/
 │   │   ├── kernel-arm64.config   # PL011 UART, GIC, PSCI, ...
 │   │   └── kernel-x86_64.config  # 8250 UART, ...
 │   ├── rootfs/
-│   │   └── etc/init.d/rcS        # init: mounts fs, runs /root/poc, drops to shell
+│   │   └── etc/init.d/rcS        # init: mounts fs, runs /root/poc, drops shell
 │   └── scripts/
 │       ├── build_kernel.sh       # fetch + configure + build Linux kernel
 │       ├── build_rootfs.sh       # build static busybox initramfs
-│       ├── pack_poc.sh           # compile PoC → inject into rootfs → repack
+│       ├── pack_poc.sh           # compile PoC, inject into rootfs, repack
 │       ├── run.sh                # launch QEMU
 │       └── check_deps.sh         # dependency checker
 ├── pocs/
-│   ├── smoke/poc.c               # end-to-end smoke test (start here)
-│   ├── template/poc.c            # PoC skeleton
+│   ├── smoke/
+│   │   ├── poc.yaml              # metadata + runtime/kernel defaults
+│   │   └── poc.c                 # end-to-end smoke test (start here)
+│   ├── template/
+│   │   ├── poc.yaml              # copy and edit for a new PoC
+│   │   └── poc.c                 # PoC skeleton
 │   └── copyfail/
+│       ├── poc.yaml              # id, kernel version, source, runtime knobs
 │       ├── poc.c                 # CVE-2026-31431
 │       └── kernel.config         # AF_ALG AEAD options required by this PoC
-├── src/                          # downloaded kernel / busybox sources (git-ignored)
-└── out/                          # build artifacts (git-ignored)
+├── src/                          # downloaded kernel / busybox sources
+└── out/                          # build artifacts
     └── <arch>/
         ├── Image / bzImage       # kernel image passed to QEMU
         ├── vmlinux               # unstripped ELF for GDB
@@ -81,21 +99,63 @@ kernel-poc/
 
 ---
 
+## PoC manifests
+
+Each runnable PoC lives under `pocs/<id>/` and is described by
+`pocs/<id>/poc.yaml`. The directory name is the id passed to `pocctl`.
+
+Important fields:
+
+| Field | Meaning |
+|-------|---------|
+| `metadata.id` / `metadata.name` | Display metadata for `./pocctl list`; keep `metadata.id` equal to the directory name |
+| `target.type` | Phase 1 supports `linux-kernel` |
+| `target.arch` | Optional target arch: `arm64` or `x86_64` |
+| `target.kernel` | Kernel version to build |
+| `exploit.source` | PoC C source path, relative to `poc.yaml` |
+| `runtime.user` | Optional non-root user for LPE PoCs |
+| `runtime.kaslr/smep/smap` | Security mitigation defaults |
+
+Example:
+
+```yaml
+metadata:
+  id: smoke
+  name: Smoke Test
+
+target:
+  type: linux-kernel
+  arch: arm64
+  kernel: "6.1.14"
+
+exploit:
+  source: poc.c
+
+runtime:
+  kaslr: "false"
+  smep: "true"
+  smap: "true"
+```
+
+---
+
 ## Per-PoC kernel configuration
 
-Each PoC can ship its own `kernel.config` fragment alongside `poc.c`.
-When you run `make poc POC=pocs/<name>/poc.c`, the build system:
+Each PoC can ship its own `kernel.config` fragment alongside `poc.c`. When you
+run `./pocctl run <id>`, `pocctl` reads `pocs/<id>/poc.yaml`, forwards the PoC
+source and runtime settings to `make`, and the build system:
 
 1. Merges `build/config/kernel-common.config`
 2. Merges `build/config/kernel-<arch>.config`
-3. Merges `pocs/<name>/kernel.config` (if it exists)
+3. Merges `pocs/<id>/kernel.config` (if it exists)
 4. Runs `olddefconfig` to resolve any conflicts
 5. Rebuilds the kernel incrementally (only changed modules recompile)
 
 This keeps each PoC's requirements isolated.
 
 **Example** (`pocs/copyfail/kernel.config`):
-```
+
+```text
 CONFIG_CRYPTO_USER_API_AEAD=y
 CONFIG_CRYPTO_AUTHENC=y
 ```
@@ -105,54 +165,63 @@ CONFIG_CRYPTO_AUTHENC=y
 ## Writing a new PoC
 
 ```bash
-# 1. Copy the template directory (includes Makefile, poc.c)
+# 1. Copy the template directory
 cp -r pocs/template pocs/my-cve
 
 # 2. Edit the PoC source
 #    Fill in exploit() in pocs/my-cve/poc.c
 
-# 3. Update the Makefile
-#    Change POC_C to pocs/my-cve/poc.c in pocs/my-cve/Makefile
+# 3. Edit pocs/my-cve/poc.yaml
+#    Set metadata.id/name, target.kernel, exploit.source, and runtime knobs.
+#    Keep metadata.id equal to the directory name used by pocctl.
 
-# 4. (Optional) Add PoC-specific kernel requirements
+# 4. Optional: add PoC-specific kernel requirements
 cat > pocs/my-cve/kernel.config <<'EOF'
 CONFIG_SOME_SUBSYSTEM=y
 EOF
 
-# 5. Run – from the repo root OR from the PoC directory:
-make poc POC=pocs/my-cve/poc.c   # from repo root
-cd pocs/my-cve && make            # from PoC directory
+# 5. Run from the repo root
+./pocctl list
+./pocctl run my-cve
 ```
 
-Each PoC directory contains its own `Makefile` so you can `cd` into it and
-run `make` directly without remembering the `POC=` argument.  Any root Makefile
-variable can be overridden from the PoC directory:
+`pocctl` accepts extra `KEY=VALUE` pairs and forwards them to the root
+`Makefile`, so you can override manifest defaults without editing `poc.yaml`:
 
 ```bash
-cd pocs/my-cve
-make SMEP=n SMAP=n        # disable mitigations
-make KASLR=y              # enable KASLR
-make debug                # launch with GDB server
+./pocctl run my-cve SMEP=n SMAP=n        # disable x86_64 mitigations
+./pocctl run my-cve KASLR=y              # enable KASLR
+./pocctl debug my-cve                    # launch with GDB server
 ```
 
 The PoC binary is compiled statically, placed at `/root/poc` in the initramfs,
-and executed automatically on boot as root.  A root shell follows for
-interactive exploration.
+and executed automatically on boot. A root shell follows for interactive
+exploration.
 
 ---
 
-## Make targets
+## pocctl commands
+
+| Command | Description |
+|---------|-------------|
+| `./pocctl list` | List PoCs discovered from `pocs/*/poc.yaml` |
+| `./pocctl run <id> [K=V ...]` | Build kernel + rootfs + PoC, inject it, and launch QEMU |
+| `./pocctl debug <id> [K=V ...]` | Same as `run`, but starts QEMU with a GDB server on `:1234` |
+| `./pocctl clean [<id>]` | Remove build artifacts for all, or for the PoC's configured arch |
+| `./pocctl help` | Show command help |
+
+`make` remains the lower-level implementation interface:
 
 | Target | Description |
 |--------|-------------|
-| `make poc POC=<path>` | **One-command:** build kernel + rootfs + PoC → launch QEMU |
+| `make poc POC=<path>` | Build kernel + rootfs + PoC, then launch QEMU |
 | `make kernel` | Build kernel only |
 | `make rootfs` | Build busybox initramfs only |
 | `make run` | Launch QEMU (plain shell, no PoC) |
-| `make debug` | Launch QEMU with GDB server on :1234 |
+| `make debug` | Launch QEMU with GDB server on `:1234` |
 | `make docker-image` | Build the cross-compilation Docker image (macOS, explicit) |
 | `make setup` | Check host dependencies |
-| `make clean` | Remove built images for current ARCH |
+| `make clean` | Remove built images for current `ARCH` |
 | `make distclean` | Remove all sources and built artifacts |
 
 ---
@@ -160,12 +229,13 @@ interactive exploration.
 ## Overriding arch and kernel version
 
 ```bash
-# ARCH is auto-detected from the host (arm64 on Apple Silicon, x86_64 otherwise)
-make poc POC=pocs/smoke/poc.c ARCH=x86_64    # force x86_64
-make poc POC=pocs/smoke/poc.c ARCH=arm64     # force arm64
+# ARCH is read from poc.yaml when present, otherwise auto-detected.
+# CLI KEY=VALUE overrides take precedence.
+./pocctl run smoke ARCH=x86_64    # force x86_64
+./pocctl run smoke ARCH=arm64     # force arm64
 
 # Use a different kernel version
-make poc POC=pocs/smoke/poc.c KERNEL_VERSION=5.15.0
+./pocctl run smoke KERNEL_VERSION=5.15.0
 ```
 
 ---
@@ -174,13 +244,14 @@ make poc POC=pocs/smoke/poc.c KERNEL_VERSION=5.15.0
 
 ```bash
 # Disable SMEP/SMAP for easier exploitation (x86_64 only)
-make poc POC=pocs/my-cve/poc.c SMEP=n SMAP=n
+./pocctl run my-cve SMEP=n SMAP=n
 
 # Enable KASLR for realistic testing (off by default)
-make poc POC=pocs/my-cve/poc.c KASLR=y
+./pocctl run my-cve KASLR=y
 ```
 
-arm64 always has PAN (≈SMAP) and PXN (≈SMEP) enabled at the hardware level.
+arm64 always has PAN (similar to SMAP) and PXN (similar to SMEP) enabled at the
+hardware level.
 
 ---
 
@@ -188,7 +259,7 @@ arm64 always has PAN (≈SMAP) and PXN (≈SMEP) enabled at the hardware level.
 
 ```bash
 # Terminal 1: launch QEMU paused, waiting for GDB
-make debug
+./pocctl debug smoke
 
 # Terminal 2: attach
 gdb out/arm64/vmlinux

@@ -18,6 +18,17 @@ ROOTFS_IMG="$ARCH_OUT/rootfs.img"
 POC_INPUT="$1"
 POC_BIN="$ARCH_OUT/poc"
 
+if [ -n "$CROSS_COMPILE" ] && command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1; then
+    CC="${CROSS_COMPILE}gcc"
+    CC_DESC="Cross-compiling with $CC"
+elif command -v musl-gcc >/dev/null 2>&1 && [ "$ARCH" = "x86_64" ]; then
+    CC="musl-gcc"
+    CC_DESC="Compiling with musl-gcc (smaller static binary)"
+else
+    CC="gcc"
+    CC_DESC="Compiling with $CC -static"
+fi
+
 # ── Validate inputs ───────────────────────────────────────────────────────────
 if [ -z "$POC_INPUT" ]; then
     echo "Usage: pack_poc.sh <path/to/poc.c>" >&2
@@ -37,18 +48,7 @@ fi
 # ── Compile PoC ───────────────────────────────────────────────────────────────
 if [[ "$POC_INPUT" == *.c ]]; then
     echo "[*] Compiling $POC_INPUT for $ARCH ..."
-
-    # Choose compiler: prefer cross-compiler, fall back to musl-gcc or gcc
-    if [ -n "$CROSS_COMPILE" ] && command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1; then
-        CC="${CROSS_COMPILE}gcc"
-        echo "    Cross-compiling with $CC"
-    elif command -v musl-gcc >/dev/null 2>&1 && [ "$ARCH" = "x86_64" ]; then
-        CC="musl-gcc"
-        echo "    Compiling with musl-gcc (smaller static binary)"
-    else
-        CC="gcc"
-        echo "    Compiling with $CC -static"
-    fi
+    echo "    $CC_DESC"
 
     "$CC" -O1 -static -g -Wall -Wno-unused-result \
         -o "$POC_BIN" "$POC_INPUT" \
@@ -76,8 +76,20 @@ if [ -n "${POC_USER:-}" ]; then
     echo "$POC_USER" > "$ROOTFS_DIR/root/poc.user"
     chmod 755 "$ROOTFS_DIR/root/poc"   # world-executable
     chmod 755 "$ROOTFS_DIR/root"       # open /root/ so non-root can enter
+
+    if [ -n "${POC_CAPS:-}" ]; then
+        echo "[*] LPE mode: granting PoC capabilities '$POC_CAPS'"
+        echo "$POC_CAPS" > "$ROOTFS_DIR/root/poc.caps"
+        "$CC" -O2 -static -Wall -Wno-unused-result \
+            -o "$ARCH_OUT/poc-cap-launcher" "$BUILD_DIR/scripts/poc_cap_launcher.c"
+        cp "$ARCH_OUT/poc-cap-launcher" "$ROOTFS_DIR/root/poc-cap-launcher"
+        chmod 700 "$ROOTFS_DIR/root/poc-cap-launcher"
+    else
+        rm -f "$ROOTFS_DIR/root/poc.caps" "$ROOTFS_DIR/root/poc-cap-launcher"
+    fi
 else
     rm -f "$ROOTFS_DIR/root/poc.user"  # clean up if switching from LPE to root mode
+    rm -f "$ROOTFS_DIR/root/poc.caps" "$ROOTFS_DIR/root/poc-cap-launcher"
     chmod 700 "$ROOTFS_DIR/root/poc"
 fi
 

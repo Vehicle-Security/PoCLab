@@ -46,7 +46,7 @@ _make_args_from_yaml() {
     local poc_dir="$1"
     local poc_yaml="$poc_dir/poc.yaml"
 
-    local target_type kernel arch source kaslr smep smap run_as
+    local target_type kernel arch source kaslr smep smap run_as caps
 
     target_type="$(_yaml_get "$poc_yaml" type)"
     kernel="$(_yaml_get "$poc_yaml" kernel)"
@@ -56,6 +56,7 @@ _make_args_from_yaml() {
     smep="$(_yaml_get "$poc_yaml" smep)"
     smap="$(_yaml_get "$poc_yaml" smap)"
     run_as="$(_yaml_get "$poc_yaml" user)"
+    caps="$(_yaml_get "$poc_yaml" capabilities)"
 
     # Phase 1 only supports linux-kernel
     local effective_type="${target_type:-linux-kernel}"
@@ -86,6 +87,7 @@ _make_args_from_yaml() {
         [ "$smap" = "false" ] && echo "SMAP=n" || echo "SMAP=y"
     fi
     [ -n "$run_as" ] && echo "POC_USER=$run_as"
+    [ -n "$caps" ] && echo "POC_CAPS=$caps"
 }
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -124,10 +126,11 @@ cmd_run() {
     kernel="$(_yaml_get "$poc_yaml" kernel)"
     arch="$(_yaml_get "$poc_yaml" arch)"
 
-    local run_as_info
+    local run_as_info caps_info
     run_as_info="$(_yaml_get "$poc_yaml" user)"
-    echo "[pocctl] PoC: $id – ${name:-(unnamed)}"
-    echo "[pocctl] kernel=${kernel:-default}  arch=${arch:-auto}${run_as_info:+  user=$run_as_info (LPE)}"
+    caps_info="$(_yaml_get "$poc_yaml" capabilities)"
+    echo "[pocctl] PoC: $id - ${name:-(unnamed)}"
+    echo "[pocctl] kernel=${kernel:-default}  arch=${arch:-auto}${run_as_info:+  user=$run_as_info (LPE)}${caps_info:+  caps=$caps_info}"
     [ "${#extra_args[@]}" -gt 0 ] && echo "[pocctl] extra: ${extra_args[*]}"
     echo ""
 
@@ -198,6 +201,7 @@ Each PoC lives in pocs/<id>/poc.yaml. Fields read by pocctl:
   target.kernel_config – optional kernel config fragment filename
   exploit.source       – PoC C source file (relative to poc.yaml)
   runtime.user         – run as this user in QEMU (e.g. "user" for LPE PoCs)
+  runtime.capabilities – optional caps for the PoC process (e.g. "cap_net_admin")
   runtime.kaslr/smep/smap – security knob overrides
 
 Extra KEY=VALUE pairs on the command line override poc.yaml values, e.g.:
