@@ -1,6 +1,8 @@
 
 ###
 
+候选漏洞目录（来源与 PoC 链接）：[VULN_CATALOG.md](./VULN_CATALOG.md)
+还没核对，我明天核对下选一些加进去
 https://github.com/ww9210/Linux_kernel_exploits
 
 
