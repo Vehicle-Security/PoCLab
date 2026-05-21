@@ -49,9 +49,11 @@ install -m 755 "$SRC/vulnerable"      "$GUEST_DIR/vulnerable"
 
 # copy-fail-c defaults to /usr/bin/su. Keep the main BusyBox binary normal
 # because /sbin/init also resolves to it; use a separate setuid copy as target.
+# Copy without setuid first; chmod 4755 happens inside Docker so the Linux
+# kernel sets the bit – macOS→VirtioFS→Docker loses the setuid bit otherwise.
 chmod 755 "$ROOTFS/bin/busybox"
 rm -f "$ROOTFS/usr/bin/su"
-install -m 4755 "$ROOTFS/bin/busybox" "$ROOTFS/usr/bin/su"
+cp "$ROOTFS/bin/busybox" "$ROOTFS/usr/bin/su"
 
 # LPE mode: start exploit as non-root uid 1000. The exploit mutates the cached
 # setuid target and execs "su", which should load the payload as root.
@@ -59,13 +61,17 @@ cat > "$ROOTFS/root/poc" <<'EOF'
 #!/bin/sh
 export PATH=/usr/bin:/bin:/sbin:/usr/sbin
 cd /root/copyfail
-id
+whoami
 exec ./exploit
-echo "After execve, id should show uid=0 (root) if exploit succeeded"
-id
 EOF
 echo "user" > "$ROOTFS/root/poc.user"
 chmod 755 "$ROOTFS/root" "$GUEST_DIR" "$ROOTFS/root/poc"
+
+# Suppress busybox init's default askfirst shells (they fight for /dev/console)
+install -m 644 "$ROOT/build/rootfs/etc/inittab" "$ROOTFS/etc/inittab"
+
+# Sync any other overlay files that may have changed since make rootfs
+install -m 755 "$ROOT/build/rootfs/etc/init.d/rcS" "$ROOTFS/etc/init.d/rcS"
 
 # Repack rootfs.img
 echo "[*] Repacking rootfs.img ..."

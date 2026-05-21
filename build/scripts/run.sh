@@ -29,34 +29,58 @@ fi
 
 # ── Security knobs ────────────────────────────────────────────────────────────
 KASLR="${KASLR:-n}"
-
-APPEND="root=/dev/ram rdinit=/sbin/init oops=panic panic=1 panic_on_warn=1"
-[ "$KASLR" != "y" ] && APPEND="$APPEND nokaslr"
+ROOT_DEV="${ROOT_DEV:-/dev/ram}"
 
 # ── Arch-specific QEMU setup ──────────────────────────────────────────────────
 EXTRA_ARGS=()
+KERNEL_ARCH_ARGS=()
 
 case "$ARCH" in
     arm64)
         MACHINE_ARGS=(-M virt)
         ARM64_CPU_TCG="cortex-a57"
-        APPEND="console=ttyAMA0 $APPEND"
+        CONSOLE_ARG="console=ttyAMA0"
         ;;
     x86_64)
         SMEP="${SMEP:-y}"
         SMAP="${SMAP:-y}"
+        PTI="${PTI:-on}"
         CPU_FLAGS="qemu64"
         [ "$SMEP" = "y" ] && CPU_FLAGS="$CPU_FLAGS,+smep"
         [ "$SMAP" = "y" ] && CPU_FLAGS="$CPU_FLAGS,+smap"
         MACHINE_ARGS=(-cpu "$CPU_FLAGS")
-        APPEND="console=ttyS0 $APPEND"
-        echo "    SMEP=$SMEP  SMAP=$SMAP"
+        CONSOLE_ARG="console=ttyS0"
+        KERNEL_ARCH_ARGS+=("pti=$PTI")
+        echo "    SMEP=$SMEP  SMAP=$SMAP  PTI=$PTI"
         ;;
     *)
         MACHINE_ARGS=()
-        APPEND="console=ttyS0 $APPEND"
+        CONSOLE_ARG="console=ttyS0"
         ;;
 esac
+
+APPEND_ARGS=(
+    "$CONSOLE_ARG"
+    "root=$ROOT_DEV"
+    rw
+    rdinit=/sbin/init
+)
+
+if [ "$KASLR" = "y" ]; then
+    APPEND_ARGS+=(kaslr)
+else
+    APPEND_ARGS+=(nokaslr)
+fi
+
+APPEND_ARGS+=(
+    ${KERNEL_ARCH_ARGS[@]+"${KERNEL_ARCH_ARGS[@]}"}
+    quiet
+    oops=panic
+    panic=1
+    panic_on_warn=1
+)
+
+APPEND="${APPEND_ARGS[*]}"
 
 # ── macOS: HVF acceleration when host arch matches target arch ────────────────
 if [ "$(uname)" = "Darwin" ]; then
@@ -87,18 +111,19 @@ fi
 
 # ── Launch ─────────────────────────────────────────────────────────────────────
 echo "[*] Starting QEMU ($ARCH) ...  KASLR=$KASLR"
+echo "    append: $APPEND"
 echo "    Press Ctrl-A X to quit QEMU"
 echo ""
 
 QEMU_CMD=(
     "$QEMU_BIN"
-    "${MACHINE_ARGS[@]}"
+    ${MACHINE_ARGS[@]+"${MACHINE_ARGS[@]}"}
     -kernel "$KERNEL_IMG"
     -initrd "$ROOTFS_IMG"
     -append "$APPEND"
     -m 256M
-    -display none
-    -serial mon:stdio
+    -nographic
+    -monitor /dev/null
     -no-reboot
 )
 
@@ -106,4 +131,10 @@ if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
     QEMU_CMD+=("${EXTRA_ARGS[@]}")
 fi
 
-exec "${QEMU_CMD[@]}"
+STTY_STATE=""
+if [ -t 0 ]; then
+    STTY_STATE="$(stty -g 2>/dev/null || true)"
+    trap 'if [ -n "$STTY_STATE" ]; then stty "$STTY_STATE" 2>/dev/null || true; fi' EXIT
+fi
+
+"${QEMU_CMD[@]}"
