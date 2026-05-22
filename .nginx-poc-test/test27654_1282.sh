@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -e
+LAB="$HOME/nginx-poc-lab"
+POCLAB="/mnt/d/download/PoClab/PoCLab"
+VER=1.28.2
+prefix="$LAB/nginx-$VER"
+src="$LAB/nginx-$VER-src"
+if [ ! -x "$prefix/sbin/nginx" ]; then
+  wget -q -O "$LAB/n.tar.gz" "https://nginx.org/download/nginx-$VER.tar.gz"
+  tar -xf "$LAB/n.tar.gz" -C "$LAB"
+  mv "$LAB/nginx-$VER" "$src"
+  cd "$src"
+  ./configure --prefix="$prefix" --with-pcre="$LAB/pcre-8.45" --with-http_dav_module \
+    --with-cc-opt="-Wno-error=cast-function-type -Wno-cast-function-type"
+  make -j"$(nproc)"
+  make install
+fi
+pkill -f "$LAB/nginx-" 2>/dev/null||true
+sleep 1
+cat >"$LAB/conf/27654b.conf" <<EOF
+worker_processes 1;
+error_log $LAB/27654-error.log info;
+pid $LAB/27654.pid;
+events { worker_connections 64; }
+http {
+    server {
+        listen 27654;
+        client_max_body_size 1m;
+        location /uploads/ {
+            alias /data/files/;
+            dav_methods PUT DELETE MKCOL COPY MOVE;
+            create_full_put_path on;
+        }
+    }
+}
+EOF
+unshare -Ur bash <<'IN'
+set -e
+LAB="$HOME/nginx-poc-lab"
+POCLAB="/mnt/d/download/PoClab/PoCLab"
+mkdir -p /data/files
+chmod 777 /data/files
+"$LAB/nginx-1.28.2/sbin/nginx" -c "$LAB/conf/27654b.conf"
+python3 "$POCLAB/pocs/CVE-2026-27654/poc.py" "http://127.0.0.1:27654"
+IN
