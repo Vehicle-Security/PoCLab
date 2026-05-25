@@ -1,0 +1,56 @@
+Chrome 沙箱逃逸 / 利用链相关 issue（issues.chromium.org 可访问）
+
+CVE-2025-2783
+Issue: https://issues.chromium.org/issues/405143032
+组件: Mojo (Windows)
+说明: Mojo IPC 句柄处理错误，远程攻击者可通过恶意文件实现沙箱逃逸。2025 年在野利用，CISA KEV。
+
+CVE-2024-5274
+Issue: https://issues.chromium.org/issues/341663589
+组件: V8
+说明: Turbofan type confusion，远程攻击者可在 renderer 沙箱内执行任意代码。2024 年在野利用，常作完整攻击链首段。
+
+CVE-2024-5830
+Issue: https://issues.chromium.org/issues/342456991
+组件: V8
+说明: TryFastAddDataProperty 中 fast/dictionary 对象 type confusion，可导致 OOB 写并在 renderer 沙箱内 RCE。GitHub Security Lab (GHSL-2024-095) 报告。
+
+CVE-2024-5836
+Issue: https://issues.chromium.org/issues/338248595
+组件: DevTools
+说明: 恶意扩展滥用 chrome.devtools.inspectedWindow.reload 与 WebUI 导航之间的竞态，在 chrome:// 特权页执行 JS，实现沙箱逃逸。VRP $20000。
+
+CVE-2024-3832
+Issue: https://issues.chromium.org/issues/331358160
+组件: V8 / WebAssembly
+说明: WasmJs::InstallSuspenderConstructor 等路径对 WebAssembly 全局对象校验不足，可导致 renderer 内对象 corruption。GHSL-2024-071。
+
+CVE-2025-4609
+Issue: https://issues.chromium.org/issues/412578726
+组件: Mojo (Windows)
+说明: Mojo 在特定情况下提供错误句柄，远程攻击者可通过恶意文件实现沙箱逃逸。与 CVE-2025-2783 同类。
+
+CVE-2025-12428
+Issue: https://issues.chromium.org/issues/447613211
+组件: V8
+说明: inline cache 加载 WebAssembly 对象 prototype 时 type confusion，可导致 renderer 内 RCE。GHSL-2025-114。
+
+CVE-2024-6778
+Issue: https://issues.chromium.org/issues/341136300
+组件: DevTools
+说明: DevTools inspectedWindow 相关 race，恶意扩展可向特权页注入脚本或 HTML。与 CVE-2024-5836 同链（ading 披露）。
+
+CVE-2024-3833
+Issue: https://issues.chromium.org/issues/331383939
+组件: V8 / WebAssembly
+说明: WasmJs::InstallTypeReflection 未检查属性是否已存在，导致 JS 对象 corruption 并可在 renderer 内 RCE。GHSL-2024-070。
+
+CVE-2019-25154
+Issue: https://issues.chromium.org/issues/40094752
+组件: iframe
+说明: iframe 实现不当，远程攻击者可通过特制 HTML 页实现沙箱逃逸。
+
+CVE-2020-16045
+Issue: https://crbug.com/1125614
+组件: Payments (Android)
+说明: PaymentAppServiceBridge 中 RenderFrameHost 裸指针 UAF，需先攻陷 renderer，可导致 browser 进程 UAF 并实现沙箱逃逸。GHSL-2020-165。
