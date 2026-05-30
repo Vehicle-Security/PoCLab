@@ -29,6 +29,7 @@ fi
 
 # ── Security knobs ────────────────────────────────────────────────────────────
 KASLR="${KASLR:-n}"
+SMP="${SMP:-1}"
 ROOT_DEV="${ROOT_DEV:-/dev/ram}"
 
 # ── Arch-specific QEMU setup ──────────────────────────────────────────────────
@@ -72,13 +73,15 @@ else
     APPEND_ARGS+=(nokaslr)
 fi
 
+PANIC_ON_WARN="${PANIC_ON_WARN:-y}"
+
 APPEND_ARGS+=(
     ${KERNEL_ARCH_ARGS[@]+"${KERNEL_ARCH_ARGS[@]}"}
     quiet
     oops=panic
     panic=1
-    panic_on_warn=1
 )
+[ "$PANIC_ON_WARN" = "y" ] && APPEND_ARGS+=(panic_on_warn=1)
 
 APPEND="${APPEND_ARGS[*]}"
 
@@ -122,6 +125,7 @@ QEMU_CMD=(
     -initrd "$ROOTFS_IMG"
     -append "$APPEND"
     -m 256M
+    -smp "$SMP"
     -nographic
     -monitor /dev/null
     -no-reboot

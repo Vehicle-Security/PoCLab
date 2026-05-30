@@ -206,6 +206,7 @@ exploration.
 |---------|-------------|
 | `./pocctl list` | List PoCs discovered from `pocs/*/poc.yaml` |
 | `./pocctl run <id> [K=V ...]` | Build kernel + rootfs + PoC, inject it, and launch QEMU |
+| `./pocctl shielded <id> [K=V ...]` | Run the PoC with AutoShield artifacts injected into the guest |
 | `./pocctl debug <id> [K=V ...]` | Same as `run`, but starts QEMU with a GDB server on `:1234` |
 | `./pocctl clean [<id>]` | Remove build artifacts for all, or for the PoC's configured arch |
 | `./pocctl help` | Show command help |
@@ -215,6 +216,7 @@ exploration.
 | Target | Description |
 |--------|-------------|
 | `make poc POC=<path>` | Build kernel + rootfs + PoC, then launch QEMU |
+| `make poc-shielded POC=<path> SHIELD_MODE=kernel\|frida AUTOSHIELD_DIR=../AutoShield` | Export AutoShield artifacts from a local private checkout, inject them into rootfs, then launch QEMU |
 | `make kernel` | Build kernel only |
 | `make rootfs` | Build busybox initramfs only |
 | `make run` | Launch QEMU (plain shell, no PoC) |
@@ -223,6 +225,30 @@ exploration.
 | `make setup` | Check host dependencies |
 | `make clean` | Remove built images for current `ARCH` |
 | `make distclean` | Remove all sources and built artifacts |
+
+## Optional AutoShield integration
+
+PoCLab does not vendor or require AutoShield. The public baseline path remains:
+
+```bash
+./pocctl run smoke
+make poc POC=pocs/smoke/poc.c
+```
+
+When a local private AutoShield checkout is available, use the shielded path:
+
+```bash
+./pocctl shielded smoke SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield
+./pocctl shielded smoke SHIELD_MODE=frida AUTOSHIELD_DIR=../AutoShield
+```
+
+The integration contract is artifact-based:
+
+1. PoCLab calls `make -C "$AUTOSHIELD_DIR" export SHIELD_MODE=<kernel|frida> OUT=<PoCLab/out/.../autoshield>`.
+2. PoCLab copies the exported artifacts into `/root/autoshield` inside the initramfs.
+3. `/etc/init.d/rcS` loads kernel modules before `/root/poc`, or runs `/root/poc` through the exported Frida wrapper.
+
+Kernel mode expects at least one `*.ko` in the exported `kernel/` artifacts. Frida mode expects `run-frida-hook.sh` or `agent.js` in the exported `frida/` artifacts.
 
 ---
 

@@ -24,6 +24,28 @@ ROOTFS_IMG="$ARCH_OUT/rootfs.img"
 
 mkdir -p "$SRC_DIR" "$ARCH_OUT"
 
+# ── Incremental build guard ───────────────────────────────────────────────────
+ROOTFS_HASH_FILE="$ARCH_OUT/.poclab-rootfs-hash"
+
+_rootfs_hash() {
+    {
+        echo "$BUSYBOX_VERSION"
+        echo "$ARCH"
+        # Hash the rootfs overlay (passwd, rcS, inittab, etc.) so any edit triggers a rebuild.
+        find "$ROOTFS_OVERLAY" -type f | sort | xargs md5sum 2>/dev/null
+    } | md5sum | cut -d' ' -f1
+}
+
+CURRENT_ROOTFS_HASH="$(_rootfs_hash)"
+
+if [ "${FORCE_REBUILD:-0}" = "0" ] && \
+   [ -f "$ROOTFS_IMG" ] && \
+   [ -f "$BUSYBOX_BUILD/_install/bin/busybox" ] && \
+   [ "$(cat "$ROOTFS_HASH_FILE" 2>/dev/null)" = "$CURRENT_ROOTFS_HASH" ]; then
+    echo "[*] Rootfs ($ARCH, busybox-$BUSYBOX_VERSION) up-to-date — skipping build."
+    exit 0
+fi
+
 # ── 1. Download busybox ───────────────────────────────────────────────────────
 if [ ! -d "$BUSYBOX_SRC" ]; then
     TARBALL="busybox-$BUSYBOX_VERSION.tar.bz2"
@@ -88,6 +110,11 @@ mkdir -p "$ROOTFS_DIR"/{bin,dev,etc/init.d,home/user,lib,lib64,mnt,proc,root,run
 # Copy busybox install tree
 cp -a "$BUSYBOX_BUILD/_install/." "$ROOTFS_DIR/"
 
+# Stable setuid-root target for page-cache LPE PoCs.  copyfail overwrites only
+# this file's cached pages, leaving /bin/busybox usable for the rest of init.
+cp "$ROOTFS_DIR/bin/busybox" "$ROOTFS_DIR/usr/bin/suid-target"
+chmod 4755 "$ROOTFS_DIR/usr/bin/suid-target"
+
 # Copy our rootfs overlay (etc/init.d/rcS, etc.)
 if [ -d "$ROOTFS_OVERLAY" ]; then
     cp -a "$ROOTFS_OVERLAY/." "$ROOTFS_DIR/"
@@ -101,6 +128,8 @@ echo "[*] Packing rootfs.img ..."
     cd "$ROOTFS_DIR"
     find . | cpio -H newc -o
 ) > "$ROOTFS_IMG"
+
+echo "$CURRENT_ROOTFS_HASH" > "$ROOTFS_HASH_FILE"
 
 SIZE_KB=$(du -k "$ROOTFS_IMG" | cut -f1)
 echo ""

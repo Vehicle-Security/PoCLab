@@ -24,7 +24,7 @@ exploit:
 
 verify:
   type: log
-  success_pattern: "page-cache write succeeded|pwned"
+  success_pattern: "page cache mutated|uid=0\\(root\\)"
   fail_pattern: "Operation not permitted|EPERM|failed"
 
 runtime:
