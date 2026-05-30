@@ -22,6 +22,7 @@ echo ""
 
 # Ensure /usr/bin/su is setuid-root (host-side cpio can't preserve setuid via VirtioFS)
 [ -f /usr/bin/su ] && chmod 4755 /usr/bin/su
+[ -f /usr/bin/suid-target ] && chmod 4755 /usr/bin/suid-target
 
 # Disable dmesg rate limiting for PoC output visibility
 echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null || true
@@ -33,26 +34,88 @@ echo -1 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true
 [ -f /proc/sys/vm/unprivileged_userfaultfd ] && echo 1 > /proc/sys/vm/unprivileged_userfaultfd 2>/dev/null || true
 echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null || true
 
+SHIELD_MODE=off
+SHIELD_DIR=/root/autoshield
+SHIELD_STATUS=0
+
+if [ -f /root/autoshield/shield.env ]; then
+    . /root/autoshield/shield.env
+fi
+
+prepare_shield() {
+    case "$SHIELD_MODE" in
+        off|"")
+            return 0
+            ;;
+        kernel)
+            echo "[*] AutoShield: loading kernel module(s) from $SHIELD_DIR"
+            MODULE_ARGS=""
+            [ -f "$SHIELD_DIR/module.args" ] && MODULE_ARGS=$(cat "$SHIELD_DIR/module.args")
+            FOUND_MODULE=0
+            for module in $(find "$SHIELD_DIR" -type f -name '*.ko'); do
+                [ -f "$module" ] || continue
+                FOUND_MODULE=1
+                # shellcheck disable=SC2086
+                if ! insmod "$module" $MODULE_ARGS; then
+                    echo "[-] AutoShield: failed to load $module"
+                    return 1
+                fi
+            done
+            if [ "$FOUND_MODULE" -eq 0 ]; then
+                echo "[-] AutoShield: no .ko found in $SHIELD_DIR"
+                return 1
+            fi
+            ;;
+        frida)
+            echo "[*] AutoShield: using Frida hook from $SHIELD_DIR"
+            if [ ! -x "$SHIELD_DIR/poc-frida-wrapper" ]; then
+                echo "[-] AutoShield: missing executable poc-frida-wrapper"
+                return 1
+            fi
+            ;;
+        *)
+            echo "[-] AutoShield: unsupported SHIELD_MODE=$SHIELD_MODE"
+            return 1
+            ;;
+    esac
+}
+
+poc_entrypoint() {
+    if [ "$SHIELD_MODE" = "frida" ]; then
+        echo "$SHIELD_DIR/poc-frida-wrapper"
+    else
+        echo "/root/poc"
+    fi
+}
+
+if ! prepare_shield; then
+    SHIELD_STATUS=1
+fi
+
 # Run PoC if present
 # If /root/poc.user exists, run as that user (supports LPE PoCs that must start non-root)
-if [ -x /root/poc ]; then
+if [ "$SHIELD_STATUS" -eq 0 ] && [ -x /root/poc ]; then
+    POC_ENTRY=$(poc_entrypoint)
     if [ -f /root/poc.user ]; then
         POC_RUN_AS=$(cat /root/poc.user)
         echo "[*] Running /root/poc as user: $POC_RUN_AS  (LPE: starts non-root, should escalate to root)"
         echo "-----------------------------------------------------"
         if [ -x /root/poc-cap-launcher ] && [ -f /root/poc.caps ]; then
-            /root/poc-cap-launcher "$POC_RUN_AS" "$(cat /root/poc.caps)" /root/poc
+            /root/poc-cap-launcher "$POC_RUN_AS" "$(cat /root/poc.caps)" "$POC_ENTRY"
         else
-            setsid /bin/cttyhack setuidgid "$POC_RUN_AS" /root/poc < /dev/console > /dev/console 2>&1
+            setsid /bin/cttyhack setuidgid "$POC_RUN_AS" "$POC_ENTRY" < /dev/console > /dev/console 2>&1
         fi
     else
         echo "[*] Running /root/poc as uid=$(id -u) ..."
         echo "-----------------------------------------------------"
-        /root/poc
+        "$POC_ENTRY"
     fi
     POC_STATUS=$?
     echo "-----------------------------------------------------"
     echo "[*] PoC exited with status $POC_STATUS"
+    echo ""
+elif [ "$SHIELD_STATUS" -ne 0 ]; then
+    echo "[-] Skipping PoC because AutoShield setup failed"
     echo ""
 fi
 

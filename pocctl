@@ -4,6 +4,7 @@
 # Usage:
 #   pocctl list                  – list all PoCs with poc.yaml
 #   pocctl run   <id> [K=V ...]  – build + inject + run in QEMU
+#   pocctl shielded <id> [K=V ...] – same as run, with AutoShield artifacts
 #   pocctl debug <id> [K=V ...]  – same, but with GDB server on :1234
 #   pocctl clean [<id>]          – remove build artifacts
 #   pocctl help                  – this message
@@ -46,7 +47,7 @@ _make_args_from_yaml() {
     local poc_dir="$1"
     local poc_yaml="$poc_dir/poc.yaml"
 
-    local target_type kernel arch source kaslr smep smap run_as caps
+    local target_type kernel arch source kaslr smep smap smp panic_on_warn run_as caps
 
     target_type="$(_yaml_get "$poc_yaml" type)"
     kernel="$(_yaml_get "$poc_yaml" kernel)"
@@ -55,6 +56,8 @@ _make_args_from_yaml() {
     kaslr="$(_yaml_get "$poc_yaml" kaslr)"
     smep="$(_yaml_get "$poc_yaml" smep)"
     smap="$(_yaml_get "$poc_yaml" smap)"
+    smp="$(_yaml_get "$poc_yaml" smp)"
+    panic_on_warn="$(_yaml_get "$poc_yaml" panic_on_warn)"
     run_as="$(_yaml_get "$poc_yaml" user)"
     caps="$(_yaml_get "$poc_yaml" capabilities)"
 
@@ -85,6 +88,10 @@ _make_args_from_yaml() {
     fi
     if [ -n "$smap" ]; then
         [ "$smap" = "false" ] && echo "SMAP=n" || echo "SMAP=y"
+    fi
+    [ -n "$smp" ] && echo "SMP=$smp"
+    if [ -n "$panic_on_warn" ]; then
+        [ "$panic_on_warn" = "false" ] && echo "PANIC_ON_WARN=n" || echo "PANIC_ON_WARN=y"
     fi
     [ -n "$run_as" ] && echo "POC_USER=$run_as"
     [ -n "$caps" ] && echo "POC_CAPS=$caps"
@@ -145,6 +152,33 @@ cmd_run() {
     make -C "$REPO_ROOT" poc "${make_args[@]}"
 }
 
+cmd_shielded() {
+    local id="$1"; shift
+    local extra_args=("$@")
+
+    local poc_dir
+    poc_dir="$(_find_poc_dir "$id")"
+
+    local poc_yaml="$poc_dir/poc.yaml"
+    local name kernel arch
+    name="$(_yaml_get "$poc_yaml" name)"
+    kernel="$(_yaml_get "$poc_yaml" kernel)"
+    arch="$(_yaml_get "$poc_yaml" arch)"
+
+    echo "[pocctl] Shielded PoC: $id - ${name:-(unnamed)}"
+    echo "[pocctl] kernel=${kernel:-default}  arch=${arch:-auto}"
+    [ "${#extra_args[@]}" -gt 0 ] && echo "[pocctl] extra: ${extra_args[*]}"
+    echo ""
+
+    local make_args=()
+    while IFS= read -r arg; do
+        make_args+=("$arg")
+    done < <(_make_args_from_yaml "$poc_dir")
+    [ "${#extra_args[@]}" -gt 0 ] && make_args+=("${extra_args[@]}")
+
+    make -C "$REPO_ROOT" poc-shielded "${make_args[@]}"
+}
+
 cmd_debug() {
     local id="$1"; shift
     local extra_args=("$@")
@@ -191,6 +225,7 @@ pocctl – PoC Lab controller  (Phase 1: Linux kernel via QEMU)
 Usage:
   pocctl list                    List all available PoCs (reads poc.yaml)
   pocctl run   <id> [K=V ...]   Build kernel + rootfs, inject PoC, launch QEMU
+  pocctl shielded <id> [K=V ...] Same as run, with AutoShield artifacts injected
   pocctl debug <id> [K=V ...]   Same as run, but with GDB server on :1234
   pocctl clean [<id>]            Remove build artifacts (all, or for one arch)
   pocctl help                    Show this message
@@ -208,10 +243,13 @@ Extra KEY=VALUE pairs on the command line override poc.yaml values, e.g.:
   pocctl run smoke ARCH=x86_64
   pocctl run smoke KERNEL_VERSION=5.15.0
   pocctl run smoke KASLR=y SMEP=n
+  pocctl shielded smoke SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield
+  pocctl shielded smoke SHIELD_MODE=frida AUTOSHIELD_DIR=../AutoShield
 
 Examples:
   pocctl list
   pocctl run smoke
+  pocctl shielded smoke SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield
   pocctl run copyfail
   pocctl debug smoke
   pocctl clean smoke
@@ -227,6 +265,10 @@ case "$CMD" in
     run)
         [ -n "${1:-}" ] || { cmd_help; exit 1; }
         cmd_run "$@"
+        ;;
+    shielded|run-shielded)
+        [ -n "${1:-}" ] || { cmd_help; exit 1; }
+        cmd_shielded "$@"
         ;;
     debug)
         [ -n "${1:-}" ] || { cmd_help; exit 1; }

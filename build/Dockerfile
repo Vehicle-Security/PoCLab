@@ -8,9 +8,11 @@ RUN apt-get update && apt-get install -y \
     linux-libc-dev-arm64-cross \
     musl-tools fakeroot \
  && rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
-    mkdir -p /usr/lib/x86_64-linux-gnu; \
-    for f in /usr/x86_64-linux-gnu/lib/*; do \
-        ln -sf "$f" "/usr/lib/x86_64-linux-gnu/$(basename "$f")"; \
-    done
+RUN mkdir -p /usr/lib/x86_64-linux-gnu && \
+    if [ -d /usr/x86_64-linux-gnu/lib ] && \
+       ls /usr/x86_64-linux-gnu/lib/* >/dev/null 2>&1; then \
+        for f in /usr/x86_64-linux-gnu/lib/*; do \
+            ln -sf "$f" "/usr/lib/x86_64-linux-gnu/$(basename "$f")"; \
+        done; \
+    fi
 WORKDIR /work

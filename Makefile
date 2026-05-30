@@ -11,6 +11,9 @@ endif
 KERNEL_VERSION  ?= 6.1.14
 BUSYBOX_VERSION ?= 1.36.1
 JOBS            ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+AUTOSHIELD_DIR  ?= ../AutoShield
+AUTOSHIELD_OUT  ?= $(abspath out/$(ARCH)/autoshield)
+SHIELD_MODE     ?= kernel
 
 # ── Arch-specific defaults ────────────────────────────────────────────────────
 ifeq ($(ARCH),arm64)
@@ -41,35 +44,51 @@ KASLR ?= n
 POC_DIR    := $(if $(POC),$(dir $(POC)),)
 POC_CONFIG := $(if $(POC_DIR),$(wildcard $(POC_DIR)kernel.config),)
 
-POC_USER   ?=
-POC_CAPS   ?=
+POC_USER      ?=
+POC_CAPS      ?=
+SMP           ?= 1
+PANIC_ON_WARN ?= y
+FORCE_REBUILD ?= 0
 
 export ARCH CROSS_COMPILE QEMU_BIN IMAGE_NAME
 export KERNEL_VERSION BUSYBOX_VERSION JOBS SMEP SMAP KASLR
-export POC_CONFIG POC_USER POC_CAPS
+export POC_CONFIG POC_USER POC_CAPS SMP PANIC_ON_WARN FORCE_REBUILD
+export AUTOSHIELD_OUT SHIELD_MODE
 
 # ── macOS: build via Docker, run via native QEMU ──────────────────────────────
-DOCKER_IMAGE := kernel-poc-builder
+DOCKER_IMAGE        := kernel-poc-builder:latest
+DOCKER_IMAGE_LEGACY := kernel-poc-builder-legacy:latest
+KERNEL_MAJOR        := $(firstword $(subst ., ,$(KERNEL_VERSION)))
+ACTIVE_DOCKER_IMAGE := $(if $(filter 3 4,$(KERNEL_MAJOR)),$(DOCKER_IMAGE_LEGACY),$(DOCKER_IMAGE))
 DOCKER_RUN   := docker run --rm -v "$(shell pwd):/work" -w /work \
                     -e ARCH -e CROSS_COMPILE -e IMAGE_NAME \
                     -e KERNEL_VERSION -e BUSYBOX_VERSION -e JOBS \
                     -e POC_CONFIG -e POC_USER -e POC_CAPS \
-                    $(DOCKER_IMAGE)
+                    -e SMP -e PANIC_ON_WARN -e FORCE_REBUILD \
+                    $(ACTIVE_DOCKER_IMAGE)
 
 ifeq ($(shell uname),Darwin)
 BUILD_CMD := $(DOCKER_RUN) bash
 
-# Auto-build the Docker image on first run so plain 'make poc POC=...' works
-# from a fresh clone without a separate 'make docker-image' step.
-DOCKER_ENSURE = docker image inspect $(DOCKER_IMAGE) >/dev/null 2>&1 || \
-                    (echo "[*] Docker image $(DOCKER_IMAGE) not found – building (one-time) ..." && \
-                     docker build -t $(DOCKER_IMAGE) build/)
+# Select the right Dockerfile for the kernel major version.
+# kernel 3.x / 4.x  → Dockerfile.legacy (stable image; does not change when
+#                      the main Dockerfile is updated)
+# kernel 5.x / 6.x  → Dockerfile
+DOCKERFILE = $(if $(filter 3 4,$(KERNEL_MAJOR)),build/Dockerfile.legacy,build/Dockerfile)
+
+# ensure_docker_image.sh builds the image only when:
+#   (a) it does not exist in the local Docker daemon, OR
+#   (b) the Dockerfile has changed since the last successful build.
+# A stamp file in out/.docker/ records the MD5 of the last successful
+# Dockerfile so the check is instant on subsequent runs.
+DOCKER_ENSURE = bash build/scripts/ensure_docker_image.sh \
+                    $(ACTIVE_DOCKER_IMAGE) $(DOCKERFILE)
 else
 BUILD_CMD := bash
 DOCKER_ENSURE = true
 endif
 
-.PHONY: all setup docker-image kernel rootfs run poc debug clean distclean
+.PHONY: all setup docker-image kernel rootfs run poc poc-shielded autoshield debug clean distclean
 
 all: kernel rootfs
 
@@ -79,7 +98,7 @@ setup:
 
 ## Build Docker compiler image explicitly (macOS; also done automatically by other targets)
 docker-image:
-	docker build -t $(DOCKER_IMAGE) build/
+	@bash build/scripts/ensure_docker_image.sh $(ACTIVE_DOCKER_IMAGE) $(DOCKERFILE)
 
 ## Build Linux kernel (uses common config; pass POC= to also apply PoC-specific config)
 kernel:
@@ -102,6 +121,41 @@ poc:
 	@$(BUILD_CMD) build/scripts/pack_poc.sh "$(POC)"
 	@bash build/scripts/run.sh
 
+## Export AutoShield artifacts from a local private checkout.
+## Usage: make autoshield SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield
+autoshield:
+	@test -d "$(AUTOSHIELD_DIR)" || \
+	  (echo "AutoShield not found. Set AUTOSHIELD_DIR=/path/to/AutoShield"; exit 1)
+	@case "$(SHIELD_MODE)" in kernel|frida) ;; \
+	  *) echo "Unsupported SHIELD_MODE=$(SHIELD_MODE). Use kernel or frida."; exit 1 ;; \
+	esac
+	$(MAKE) -C "$(AUTOSHIELD_DIR)" export SHIELD_MODE="$(SHIELD_MODE)" \
+		OUT="$(AUTOSHIELD_OUT)" ARCH="$(ARCH)" KERNEL_VERSION="$(KERNEL_VERSION)" \
+		KERNEL_SRC="$(abspath src/linux-$(KERNEL_VERSION))" \
+		KERNEL_BUILD="$(abspath out/kernel-build-$(ARCH))" \
+		CROSS_COMPILE="$(CROSS_COMPILE)"
+
+## Build everything and run PoC with AutoShield artifacts injected into rootfs.
+## Usage: make poc-shielded POC=pocs/smoke/poc.c SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield
+poc-shielded:
+	@[ -n "$(POC)" ] || (echo "Usage: make poc-shielded POC=<path/to/poc.c> SHIELD_MODE=kernel|frida"; exit 1)
+	@test -d "$(AUTOSHIELD_DIR)" || \
+	  (echo "AutoShield not found. Set AUTOSHIELD_DIR=/path/to/AutoShield"; exit 1)
+	@case "$(SHIELD_MODE)" in kernel|frida) ;; \
+	  *) echo "Unsupported SHIELD_MODE=$(SHIELD_MODE). Use kernel or frida."; exit 1 ;; \
+	esac
+	@$(DOCKER_ENSURE)
+	@$(BUILD_CMD) build/scripts/build_kernel.sh
+	$(MAKE) -C "$(AUTOSHIELD_DIR)" export SHIELD_MODE="$(SHIELD_MODE)" \
+		OUT="$(AUTOSHIELD_OUT)" ARCH="$(ARCH)" KERNEL_VERSION="$(KERNEL_VERSION)" \
+		KERNEL_SRC="$(abspath src/linux-$(KERNEL_VERSION))" \
+		KERNEL_BUILD="$(abspath out/kernel-build-$(ARCH))" \
+		CROSS_COMPILE="$(CROSS_COMPILE)"
+	@$(BUILD_CMD) build/scripts/build_rootfs.sh
+	@$(BUILD_CMD) build/scripts/pack_poc.sh "$(POC)"
+	@bash build/scripts/pack_shield_artifacts.sh "$(SHIELD_MODE)" "$(AUTOSHIELD_OUT)"
+	@bash build/scripts/run.sh
+
 ## Run QEMU (plain shell, no PoC)
 run:
 	@bash build/scripts/run.sh
@@ -114,6 +168,6 @@ debug:
 clean:
 	rm -rf out/$(ARCH)/
 
-## Remove everything including downloaded sources
+## Remove everything including downloaded sources and Docker stamps
 distclean:
 	rm -rf src/ out/

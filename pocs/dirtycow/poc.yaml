@@ -1,0 +1,40 @@
+apiVersion: poclab/v1
+kind: PoC
+
+metadata:
+  id: dirtycow
+  name: "CVE-2016-5195: Dirty COW"
+  description: >
+    Local privilege escalation via the copy-on-write race between
+    madvise(MADV_DONTNEED) and /proc/self/mem writes to a private read-only
+    file mapping.
+  severity: high
+  cve: CVE-2016-5195
+  tags: [kernel, lpe, mm, cow, race, fs]
+  references:
+    - https://github.com/scotty-c/dirty-cow-poc/blob/master/dirtyc0w/dirtyc0w.c
+    - https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=19be0eaffa3ac7d8eb6784ad9bdbc7d67ed8e619
+    - https://www.redhat.com/en/blog/understanding-and-mitigating-dirty-cow-vulnerability
+
+target:
+  type: linux-kernel
+  arch: x86_64
+  kernel: "4.4.21"
+  kernel_config: kernel.config
+
+exploit:
+  source: poc.c
+
+verify:
+  type: log
+  success_pattern: "dirtycow overwrite succeeded|uid=0"
+  fail_pattern: "overwrite failed|kernel is patched|could not find expected"
+
+runtime:
+  memory: 256M
+  kaslr: "false"
+  smep: "true"
+  smap: "true"
+  smp: "2"           # DirtyCOW requires >=2 CPUs; race never opens on 1 vCPU
+  panic_on_warn: "false"   # old CoW path may emit WARN_ON mid-race
+  user: user
