@@ -49,11 +49,12 @@ POC_CAPS      ?=
 SMP           ?= 1
 PANIC_ON_WARN ?= y
 FORCE_REBUILD ?= 0
+EXIT_AFTER_POC ?= 0
 
 export ARCH CROSS_COMPILE QEMU_BIN IMAGE_NAME
 export KERNEL_VERSION BUSYBOX_VERSION JOBS SMEP SMAP KASLR
 export POC_CONFIG POC_USER POC_CAPS SMP PANIC_ON_WARN FORCE_REBUILD
-export AUTOSHIELD_OUT SHIELD_MODE
+export AUTOSHIELD_OUT SHIELD_MODE EXIT_AFTER_POC
 
 # ── macOS: build via Docker, run via native QEMU ──────────────────────────────
 DOCKER_IMAGE        := kernel-poc-builder:latest
@@ -88,13 +89,24 @@ BUILD_CMD := bash
 DOCKER_ENSURE = true
 endif
 
-.PHONY: all setup docker-image kernel rootfs run poc poc-shielded autoshield debug clean distclean
+.PHONY: all setup check docker-image kernel rootfs run poc poc-shielded autoshield debug clean distclean
 
 all: kernel rootfs
 
 ## Setup: check host dependencies
 setup:
 	@bash build/scripts/check_deps.sh
+
+## Lightweight repository checks that do not build kernels or launch QEMU
+check:
+	@bash -n pocctl build/scripts/build_kernel.sh build/scripts/build_rootfs.sh \
+		build/scripts/check_deps.sh build/scripts/ensure_docker_image.sh \
+		build/scripts/pack_poc.sh build/scripts/pack_shield_artifacts.sh \
+		build/scripts/run.sh build/scripts/test_pocctl.sh
+	@sh -n build/rootfs/etc/init.d/rcS
+	@bash build/scripts/test_pocctl.sh >/dev/null
+	@./pocctl list >/dev/null
+	@./pocctl validate >/dev/null
 
 ## Build Docker compiler image explicitly (macOS; also done automatically by other targets)
 docker-image:
@@ -133,7 +145,8 @@ autoshield:
 		OUT="$(AUTOSHIELD_OUT)" ARCH="$(ARCH)" KERNEL_VERSION="$(KERNEL_VERSION)" \
 		KERNEL_SRC="$(abspath src/linux-$(KERNEL_VERSION))" \
 		KERNEL_BUILD="$(abspath out/kernel-build-$(ARCH))" \
-		CROSS_COMPILE="$(CROSS_COMPILE)"
+		CROSS_COMPILE="$(CROSS_COMPILE)" \
+		DOCKER_IMAGE="$(ACTIVE_DOCKER_IMAGE)"
 
 ## Build everything and run PoC with AutoShield artifacts injected into rootfs.
 ## Usage: make poc-shielded POC=pocs/smoke/poc.c SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield
@@ -150,7 +163,8 @@ poc-shielded:
 		OUT="$(AUTOSHIELD_OUT)" ARCH="$(ARCH)" KERNEL_VERSION="$(KERNEL_VERSION)" \
 		KERNEL_SRC="$(abspath src/linux-$(KERNEL_VERSION))" \
 		KERNEL_BUILD="$(abspath out/kernel-build-$(ARCH))" \
-		CROSS_COMPILE="$(CROSS_COMPILE)"
+		CROSS_COMPILE="$(CROSS_COMPILE)" \
+		DOCKER_IMAGE="$(ACTIVE_DOCKER_IMAGE)"
 	@$(BUILD_CMD) build/scripts/build_rootfs.sh
 	@$(BUILD_CMD) build/scripts/pack_poc.sh "$(POC)"
 	@bash build/scripts/pack_shield_artifacts.sh "$(SHIELD_MODE)" "$(AUTOSHIELD_OUT)"

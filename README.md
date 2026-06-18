@@ -48,11 +48,12 @@ it into the rootfs, and launches QEMU.
 
 ## Available PoCs
 
-Use `./pocctl list` to print the PoCs discovered from `pocs/*/poc.yaml`.
+Use `./pocctl list` to print the PoCs discovered from `pocs/*/poc.yaml`,
+including each manifest's `target.type`.
 
 | ID | Source | Description |
 |----|--------|-------------|
-| `smoke` | `pocs/smoke/poc.c` | **Environment smoke test** - run first to validate the full pipeline. Checks kernel symbols, BPF, namespaces, debugfs, perf settings. |
+| `smoke` | `pocs/smoke/poc.c` | **Environment smoke test** - run first to validate the full pipeline. Checks kernel symbols, BPF, namespaces, debugfs, perf settings, and the optional AutoShield dummy hook when loaded. |
 | `copyfail` | `pocs/copyfail/poc.c` | **CVE-2026-31431** - page-cache write without write permission via authencesn AEAD ESN out-of-bounds write. |
 | `template` | `pocs/template/poc.c` | **Skeleton** - copy this to start a new PoC. |
 
@@ -115,6 +116,9 @@ Important fields:
 | `exploit.source` | PoC C source path, relative to `poc.yaml` |
 | `runtime.user` | Optional non-root user for LPE PoCs |
 | `runtime.kaslr/smep/smap` | Security mitigation defaults |
+| `verify.type` | Output verifier type; currently `log` |
+| `verify.success_pattern` | Extended regex that identifies successful PoC output |
+| `verify.fail_pattern` | Extended regex that identifies failed or blocked PoC output |
 
 Example:
 
@@ -198,6 +202,13 @@ The PoC binary is compiled statically, placed at `/root/poc` in the initramfs,
 and executed automatically on boot. A root shell follows for interactive
 exploration.
 
+Manifest validation is available with `./pocctl validate`. For real PoCs,
+`metadata.id` must match the `pocs/<id>` directory name, IDs must be unique,
+referenced `exploit.source` / `target.kernel_config` files must exist, and
+`verify.type` must be supported while `verify.success_pattern` /
+`verify.fail_pattern` must be valid extended regexes.
+`pocs/template` is the only directory allowed to keep placeholder metadata.
+
 ---
 
 ## pocctl commands
@@ -205,6 +216,7 @@ exploration.
 | Command | Description |
 |---------|-------------|
 | `./pocctl list` | List PoCs discovered from `pocs/*/poc.yaml` |
+| `./pocctl validate` | Validate manifest references and verify patterns |
 | `./pocctl run <id> [K=V ...]` | Build kernel + rootfs + PoC, inject it, and launch QEMU |
 | `./pocctl shielded <id> [K=V ...]` | Run the PoC with AutoShield artifacts injected into the guest |
 | `./pocctl debug <id> [K=V ...]` | Same as `run`, but starts QEMU with a GDB server on `:1234` |
@@ -223,8 +235,14 @@ exploration.
 | `make debug` | Launch QEMU with GDB server on `:1234` |
 | `make docker-image` | Build the cross-compilation Docker image (macOS, explicit) |
 | `make setup` | Check host dependencies |
+| `make check` | Run lightweight script syntax and manifest reference checks |
 | `make clean` | Remove built images for current `ARCH` |
 | `make distclean` | Remove all sources and built artifacts |
+
+For automated smoke checks, add `EXIT_AFTER_POC=1` to power off the guest after
+`/root/poc` exits instead of dropping into the interactive shell.
+The same override works through `pocctl`, for example
+`./pocctl shielded smoke SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield EXIT_AFTER_POC=1`.
 
 ## Optional AutoShield integration
 
@@ -248,7 +266,19 @@ The integration contract is artifact-based:
 2. PoCLab copies the exported artifacts into `/root/autoshield` inside the initramfs.
 3. `/etc/init.d/rcS` loads kernel modules before `/root/poc`, or runs `/root/poc` through the exported Frida wrapper.
 
-Kernel mode expects at least one `*.ko` in the exported `kernel/` artifacts. Frida mode expects `run-frida-hook.sh` or `agent.js` in the exported `frida/` artifacts.
+Kernel mode expects at least one `*.ko` in the exported `kernel/` artifacts, and each module must match the selected `ARCH`. Frida mode expects `run-frida-hook.sh` or `agent.js` in the exported `frida/` artifacts.
+
+For kernel mode, the guest loads modules from `/root/autoshield/kernel` before
+running `/root/poc`, then unloads them after the PoC exits. Module files are
+loaded in sorted order and unloaded in reverse sorted order, so multi-module
+exports can express simple dependency ordering by filename.
+
+The smoke path has been verified with the local AutoShield kernel export on:
+
+| Arch | Kernel | Command |
+|------|--------|---------|
+| `arm64` | `6.1.14` | `./pocctl shielded smoke SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield EXIT_AFTER_POC=1` |
+| `x86_64` | `4.4.21` | `ARCH=x86_64 KERNEL_VERSION=4.4.21 make poc-shielded POC=pocs/smoke/poc.c SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield EXIT_AFTER_POC=1` |
 
 ---
 

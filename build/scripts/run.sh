@@ -31,6 +31,7 @@ fi
 KASLR="${KASLR:-n}"
 SMP="${SMP:-1}"
 ROOT_DEV="${ROOT_DEV:-/dev/ram}"
+EXIT_AFTER_POC="${EXIT_AFTER_POC:-0}"
 
 # ── Arch-specific QEMU setup ──────────────────────────────────────────────────
 EXTRA_ARGS=()
@@ -82,6 +83,7 @@ APPEND_ARGS+=(
     panic=1
 )
 [ "$PANIC_ON_WARN" = "y" ] && APPEND_ARGS+=(panic_on_warn=1)
+[ "$EXIT_AFTER_POC" = "1" ] && APPEND_ARGS+=(poc.exit=1)
 
 APPEND="${APPEND_ARGS[*]}"
 

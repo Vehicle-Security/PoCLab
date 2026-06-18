@@ -14,6 +14,7 @@
  *   6. debugfs mounted at /sys/kernel/debug
  *   7. perf_event_paranoid set to -1 by init script
  *   8. dmesg rate limiting disabled (printk_ratelimit=0)
+ *   9. AutoShield dummy hook, when the kernel module is loaded
  *
  * No per-PoC kernel.config needed – all required options are already
  * in build/config/kernel-common.config.
@@ -50,7 +51,7 @@
 #define info(fmt, ...) fprintf(stdout, "[*] " fmt "\n", ##__VA_ARGS__)
 
 /* ── check accounting ────────────────────────────────────────────────────── */
-static int n_pass = 0, n_fail = 0;
+static int n_pass = 0, n_fail = 0, n_skip = 0;
 
 static void report(const char *name, int passed, const char *detail)
 {
@@ -61,6 +62,12 @@ static void report(const char *name, int passed, const char *detail)
         printf("[-]  %-42s  %s\n", name, detail ? detail : "");
         n_fail++;
     }
+}
+
+static void skip(const char *name, const char *detail)
+{
+    printf("[*]  %-42s  %s\n", name, detail ? detail : "skipped");
+    n_skip++;
 }
 
 /* ══ check 1 – root ═════════════════════════════════════════════════════════ */
@@ -192,6 +199,91 @@ static void check_dmesg(void)
     report("printk_ratelimit = 0 (dmesg not throttled)", v == 0, buf);
 }
 
+/* ══ optional check 9 – AutoShield dummy kernel hook ════════════════════════ */
+static int read_text_file(const char *path, char *buf, size_t buf_len)
+{
+    int fd;
+    ssize_t n;
+
+    if (buf_len == 0) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    n = read(fd, buf, buf_len - 1);
+    close(fd);
+    if (n < 0) return -1;
+    buf[n] = '\0';
+    return 0;
+}
+
+static int write_text_file(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY);
+    size_t len = strlen(text);
+    ssize_t n;
+
+    if (fd < 0) return -1;
+    n = write(fd, text, len);
+    close(fd);
+    return n == (ssize_t)len ? 0 : -1;
+}
+
+static int proc_field_is(const char *state, const char *key, const char *want)
+{
+    char needle[128];
+    const char *line;
+    const char *value;
+    size_t want_len;
+
+    snprintf(needle, sizeof(needle), "%s=", key);
+    line = strstr(state, needle);
+    if (!line) return 0;
+
+    value = line + strlen(needle);
+    want_len = strlen(want);
+    return strncmp(value, want, want_len) == 0 &&
+           (value[want_len] == '\n' || value[want_len] == '\0');
+}
+
+static void check_autoshield_dummy(void)
+{
+    const char *proc = "/proc/autoshield_dummy";
+    char normal[1024];
+    char attack[1024];
+    int ok;
+
+    if (access(proc, F_OK) != 0) {
+        skip("AutoShield dummy hook", "not loaded; optional shield check skipped");
+        return;
+    }
+
+    if (write_text_file(proc, "normal\n") != 0 ||
+        read_text_file(proc, normal, sizeof(normal)) != 0) {
+        report("AutoShield dummy hook", 0, "normal trigger failed");
+        return;
+    }
+
+    if (write_text_file(proc, "attack\n") != 0 ||
+        read_text_file(proc, attack, sizeof(attack)) != 0) {
+        report("AutoShield dummy hook", 0, "attack trigger failed");
+        return;
+    }
+
+    ok = proc_field_is(normal, "last_decision", "PASS") &&
+         proc_field_is(normal, "last_result", "0") &&
+         proc_field_is(normal, "vuln_reached", "1") &&
+         proc_field_is(attack, "last_decision", "BLOCK") &&
+         proc_field_is(attack, "last_result", "-13") &&
+         proc_field_is(attack, "vuln_reached", "1");
+
+    report("AutoShield dummy hook", ok,
+           ok ? "normal PASS; attack BLOCK before dummy body"
+              : "unexpected /proc/autoshield_dummy state");
+    if (!ok) {
+        info("    normal state:\n%s", normal);
+        info("    attack state:\n%s", attack);
+    }
+}
+
 /* ══ main ════════════════════════════════════════════════════════════════════ */
 int main(void)
 {
@@ -206,14 +298,21 @@ int main(void)
     check_debugfs();
     check_perf();
     check_dmesg();
+    check_autoshield_dummy();
 
     puts("──────────────────────────────────────────────────────────────");
-    if (n_fail == 0)
-        printf("[+] All %d checks passed – environment ready for exploitation research\n",
-               n_pass);
-    else
+    if (n_fail == 0) {
+        if (n_skip == 0) {
+            printf("[+] All %d checks passed – environment ready for exploitation research\n",
+                   n_pass);
+        } else {
+            printf("[+] All %d mandatory checks passed (%d optional skipped) – environment ready for exploitation research\n",
+                   n_pass, n_skip);
+        }
+    } else {
         printf("[!] %d/%d checks passed – review failed items above\n",
                n_pass, n_pass + n_fail);
+    }
 
     return n_fail > 0 ? 1 : 0;
 }

@@ -3,6 +3,7 @@
 #
 # Usage:
 #   pocctl list                  – list all PoCs with poc.yaml
+#   pocctl validate              – validate poc.yaml references and verify patterns
 #   pocctl run   <id> [K=V ...]  – build + inject + run in QEMU
 #   pocctl shielded <id> [K=V ...] – same as run, with AutoShield artifacts
 #   pocctl debug <id> [K=V ...]  – same, but with GDB server on :1234
@@ -15,19 +16,48 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-POCS_DIR="$REPO_ROOT/pocs"
+POCS_DIR="${POCLAB_POCS_DIR:-$REPO_ROOT/pocs}"
 
 # ── YAML field extractor (no yq dependency) ───────────────────────────────────
-# Extracts the VALUE from the first line matching "  <field>: VALUE"
-# Works for simple scalar fields; sufficient for Phase 1 manifest.
-# Note: || true prevents set -o pipefail from aborting when grep finds no match.
-_yaml_get() {
-    local file="$1" field="$2"
-    { grep -E "^\s*${field}\s*:" "$file" 2>/dev/null || true; } | head -1 \
-        | sed 's/^[^:]*:[[:space:]]*//' \
-        | sed 's/[[:space:]]*#.*//' \
-        | tr -d '"' | tr -d "'" \
-        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+# Extracts a simple scalar VALUE from "section.field". This intentionally handles
+# only the manifest subset used by PoCLab: top-level sections with indented
+# scalar keys. It avoids ambiguity between fields such as target.type and
+# verify.type without adding a yq/Python dependency to the controller path.
+_yaml_get_section() {
+    local file="$1" section="$2" field="$3"
+    awk -v section="$section" -v field="$field" '
+        function trim(value) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            return value
+        }
+        function clean(value, sq) {
+            sub(/[[:space:]]+#.*$/, "", value)
+            value = trim(value)
+            sq = sprintf("%c", 39)
+            if (length(value) >= 2 && substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") {
+                value = substr(value, 2, length(value) - 2)
+            } else if (length(value) >= 2 && substr(value, 1, 1) == sq && substr(value, length(value), 1) == sq) {
+                value = substr(value, 2, length(value) - 2)
+            }
+            return value
+        }
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        /^[^[:space:]#][^:]*:/ {
+            key = $0
+            sub(/:.*/, "", key)
+            in_section = (key == section)
+            next
+        }
+        in_section {
+            pattern = "^[[:space:]]+" field "[[:space:]]*:"
+            if ($0 ~ pattern) {
+                value = $0
+                sub(/^[^:]*:[[:space:]]*/, "", value)
+                print clean(value)
+                exit
+            }
+        }
+    ' "$file"
 }
 
 # ── Find PoC directory by id ──────────────────────────────────────────────────
@@ -47,19 +77,20 @@ _make_args_from_yaml() {
     local poc_dir="$1"
     local poc_yaml="$poc_dir/poc.yaml"
 
-    local target_type kernel arch source kaslr smep smap smp panic_on_warn run_as caps
+    local target_type kernel arch kernel_config source kaslr smep smap smp panic_on_warn run_as caps
 
-    target_type="$(_yaml_get "$poc_yaml" type)"
-    kernel="$(_yaml_get "$poc_yaml" kernel)"
-    arch="$(_yaml_get "$poc_yaml" arch)"
-    source="$(_yaml_get "$poc_yaml" source)"
-    kaslr="$(_yaml_get "$poc_yaml" kaslr)"
-    smep="$(_yaml_get "$poc_yaml" smep)"
-    smap="$(_yaml_get "$poc_yaml" smap)"
-    smp="$(_yaml_get "$poc_yaml" smp)"
-    panic_on_warn="$(_yaml_get "$poc_yaml" panic_on_warn)"
-    run_as="$(_yaml_get "$poc_yaml" user)"
-    caps="$(_yaml_get "$poc_yaml" capabilities)"
+    target_type="$(_yaml_get_section "$poc_yaml" target type)"
+    kernel="$(_yaml_get_section "$poc_yaml" target kernel)"
+    arch="$(_yaml_get_section "$poc_yaml" target arch)"
+    kernel_config="$(_yaml_get_section "$poc_yaml" target kernel_config)"
+    source="$(_yaml_get_section "$poc_yaml" exploit source)"
+    kaslr="$(_yaml_get_section "$poc_yaml" runtime kaslr)"
+    smep="$(_yaml_get_section "$poc_yaml" runtime smep)"
+    smap="$(_yaml_get_section "$poc_yaml" runtime smap)"
+    smp="$(_yaml_get_section "$poc_yaml" runtime smp)"
+    panic_on_warn="$(_yaml_get_section "$poc_yaml" runtime panic_on_warn)"
+    run_as="$(_yaml_get_section "$poc_yaml" runtime user)"
+    caps="$(_yaml_get_section "$poc_yaml" runtime capabilities)"
 
     # Phase 1 only supports linux-kernel
     local effective_type="${target_type:-linux-kernel}"
@@ -74,12 +105,18 @@ _make_args_from_yaml() {
         exit 1
     fi
 
+    if [ -n "$kernel_config" ] && [ ! -f "$poc_dir/$kernel_config" ]; then
+        echo "[-] kernel_config not found: $poc_dir/$kernel_config" >&2
+        exit 1
+    fi
+
     # Emit KEY=VALUE pairs for make; caller captures with $()
     # Use a path relative to REPO_ROOT so it works both natively and inside Docker
     # (Docker mounts the repo at /work, so absolute host paths break POC_CONFIG).
     echo "POC=${poc_c#$REPO_ROOT/}"
     [ -n "$kernel" ] && echo "KERNEL_VERSION=$kernel"
     [ -n "$arch"   ] && echo "ARCH=$arch"
+    [ -n "$kernel_config" ] && echo "POC_CONFIG=${poc_dir#$REPO_ROOT/}/$kernel_config"
     if [ -n "$kaslr" ]; then
         [ "$kaslr" = "true" ] && echo "KASLR=y" || echo "KASLR=n"
     fi
@@ -95,29 +132,145 @@ _make_args_from_yaml() {
     fi
     [ -n "$run_as" ] && echo "POC_USER=$run_as"
     [ -n "$caps" ] && echo "POC_CAPS=$caps"
+    return 0
 }
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 cmd_list() {
-    printf "%-20s  %-8s  %-8s  %s\n" "ID" "KERNEL" "ARCH" "NAME"
-    printf "%-20s  %-8s  %-8s  %s\n" "--------------------" "--------" "--------" "----"
+    printf "%-20s  %-14s  %-8s  %-8s  %s\n" "ID" "TYPE" "KERNEL" "ARCH" "NAME"
+    printf "%-20s  %-14s  %-8s  %-8s  %s\n" "--------------------" "--------------" "--------" "--------" "----"
     local found=0
     for poc_yaml in "$POCS_DIR"/*/poc.yaml; do
         [ -f "$poc_yaml" ] || continue
         found=1
-        local poc_dir id name kernel arch
+        local poc_dir id name target_type kernel arch
         poc_dir="$(dirname "$poc_yaml")"
-        id="$(_yaml_get "$poc_yaml" id)"
-        name="$(_yaml_get "$poc_yaml" name)"
-        kernel="$(_yaml_get "$poc_yaml" kernel)"
-        arch="$(_yaml_get "$poc_yaml" arch)"
+        id="$(_yaml_get_section "$poc_yaml" metadata id)"
+        name="$(_yaml_get_section "$poc_yaml" metadata name)"
+        target_type="$(_yaml_get_section "$poc_yaml" target type)"
+        kernel="$(_yaml_get_section "$poc_yaml" target kernel)"
+        arch="$(_yaml_get_section "$poc_yaml" target arch)"
         id="${id:-$(basename "$poc_dir")}"
-        printf "%-20s  %-8s  %-8s  %s\n" "$id" "${kernel:--}" "${arch:-auto}" "${name:-(unnamed)}"
+        [ "$(basename "$poc_dir")" = "template" ] && id="template"
+        printf "%-20s  %-14s  %-8s  %-8s  %s\n" "$id" "${target_type:-linux-kernel}" "${kernel:--}" "${arch:-auto}" "${name:-(unnamed)}"
     done
     if [ "$found" -eq 0 ]; then
         echo "  (none found – add pocs/<name>/poc.yaml)"
     fi
+}
+
+cmd_validate() {
+    local found=0
+    local failed=0
+    local seen_ids=""
+
+    for poc_yaml in "$POCS_DIR"/*/poc.yaml; do
+        [ -f "$poc_yaml" ] || continue
+        found=1
+
+        local poc_dir poc_dir_name id target_type source kernel_config poc_source
+        local verify_type
+        local success_pattern fail_pattern grep_rc
+        poc_dir="$(dirname "$poc_yaml")"
+        poc_dir_name="$(basename "$poc_dir")"
+        id="$(_yaml_get_section "$poc_yaml" metadata id)"
+        target_type="$(_yaml_get_section "$poc_yaml" target type)"
+        source="$(_yaml_get_section "$poc_yaml" exploit source)"
+        kernel_config="$(_yaml_get_section "$poc_yaml" target kernel_config)"
+        verify_type="$(_yaml_get_section "$poc_yaml" verify type)"
+        success_pattern="$(_yaml_get_section "$poc_yaml" verify success_pattern)"
+        fail_pattern="$(_yaml_get_section "$poc_yaml" verify fail_pattern)"
+
+        id="${id:-$poc_dir_name}"
+        target_type="${target_type:-linux-kernel}"
+        source="${source:-poc.c}"
+        poc_source="$poc_dir/$source"
+
+        if [ "$poc_dir_name" != "template" ] && [ "$id" != "$poc_dir_name" ]; then
+            echo "[-] $poc_dir_name: metadata.id '$id' must match directory name" >&2
+            failed=1
+        fi
+
+        case "$seen_ids" in
+            *"
+$id
+"*)
+                echo "[-] $id: duplicate metadata.id" >&2
+                failed=1
+                ;;
+        esac
+        seen_ids="$seen_ids
+$id
+"
+
+        case "$target_type" in
+            linux-kernel|system-service|userspace-app) ;;
+            *)
+                echo "[-] $id: unsupported target.type '$target_type'" >&2
+                failed=1
+                ;;
+        esac
+
+        case "${verify_type:-log}" in
+            log) ;;
+            *)
+                echo "[-] $id: unsupported verify.type '$verify_type'" >&2
+                failed=1
+                ;;
+        esac
+
+        if [ ! -f "$poc_source" ]; then
+            echo "[-] $id: exploit source not found: ${poc_source#$REPO_ROOT/}" >&2
+            failed=1
+        fi
+
+        if [ -n "$kernel_config" ] && [ ! -f "$poc_dir/$kernel_config" ]; then
+            echo "[-] $id: kernel_config not found: ${poc_dir#$REPO_ROOT/}/$kernel_config" >&2
+            failed=1
+        fi
+
+        if [ -z "$success_pattern" ]; then
+            echo "[-] $id: verify.success_pattern is required" >&2
+            failed=1
+        else
+            if grep -E -- "$success_pattern" /dev/null >/dev/null 2>&1; then
+                grep_rc=0
+            else
+                grep_rc=$?
+            fi
+            if [ "$grep_rc" -eq 2 ]; then
+                echo "[-] $id: verify.success_pattern is not a valid extended regex: $success_pattern" >&2
+                failed=1
+            fi
+        fi
+
+        if [ -z "$fail_pattern" ]; then
+            echo "[-] $id: verify.fail_pattern is required" >&2
+            failed=1
+        else
+            if grep -E -- "$fail_pattern" /dev/null >/dev/null 2>&1; then
+                grep_rc=0
+            else
+                grep_rc=$?
+            fi
+            if [ "$grep_rc" -eq 2 ]; then
+                echo "[-] $id: verify.fail_pattern is not a valid extended regex: $fail_pattern" >&2
+                failed=1
+            fi
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo "[-] no poc.yaml files found under $POCS_DIR" >&2
+        return 1
+    fi
+
+    if [ "$failed" -ne 0 ]; then
+        return 1
+    fi
+
+    echo "[+] PoC manifests validated"
 }
 
 cmd_run() {
@@ -129,13 +282,13 @@ cmd_run() {
 
     local poc_yaml="$poc_dir/poc.yaml"
     local name kernel arch
-    name="$(_yaml_get "$poc_yaml" name)"
-    kernel="$(_yaml_get "$poc_yaml" kernel)"
-    arch="$(_yaml_get "$poc_yaml" arch)"
+    name="$(_yaml_get_section "$poc_yaml" metadata name)"
+    kernel="$(_yaml_get_section "$poc_yaml" target kernel)"
+    arch="$(_yaml_get_section "$poc_yaml" target arch)"
 
     local run_as_info caps_info
-    run_as_info="$(_yaml_get "$poc_yaml" user)"
-    caps_info="$(_yaml_get "$poc_yaml" capabilities)"
+    run_as_info="$(_yaml_get_section "$poc_yaml" runtime user)"
+    caps_info="$(_yaml_get_section "$poc_yaml" runtime capabilities)"
     echo "[pocctl] PoC: $id - ${name:-(unnamed)}"
     echo "[pocctl] kernel=${kernel:-default}  arch=${arch:-auto}${run_as_info:+  user=$run_as_info (LPE)}${caps_info:+  caps=$caps_info}"
     [ "${#extra_args[@]}" -gt 0 ] && echo "[pocctl] extra: ${extra_args[*]}"
@@ -143,9 +296,14 @@ cmd_run() {
 
     # Build make argument array from yaml + extra CLI overrides
     local make_args=()
+    local manifest_args
+    if ! manifest_args="$(_make_args_from_yaml "$poc_dir")"; then
+        exit 1
+    fi
     while IFS= read -r arg; do
+        [ -n "$arg" ] || continue
         make_args+=("$arg")
-    done < <(_make_args_from_yaml "$poc_dir")
+    done <<< "$manifest_args"
     # "${arr[@]}" on an empty array is an error under set -u on bash 3.2 (macOS)
     [ "${#extra_args[@]}" -gt 0 ] && make_args+=("${extra_args[@]}")
 
@@ -161,9 +319,9 @@ cmd_shielded() {
 
     local poc_yaml="$poc_dir/poc.yaml"
     local name kernel arch
-    name="$(_yaml_get "$poc_yaml" name)"
-    kernel="$(_yaml_get "$poc_yaml" kernel)"
-    arch="$(_yaml_get "$poc_yaml" arch)"
+    name="$(_yaml_get_section "$poc_yaml" metadata name)"
+    kernel="$(_yaml_get_section "$poc_yaml" target kernel)"
+    arch="$(_yaml_get_section "$poc_yaml" target arch)"
 
     echo "[pocctl] Shielded PoC: $id - ${name:-(unnamed)}"
     echo "[pocctl] kernel=${kernel:-default}  arch=${arch:-auto}"
@@ -171,9 +329,14 @@ cmd_shielded() {
     echo ""
 
     local make_args=()
+    local manifest_args
+    if ! manifest_args="$(_make_args_from_yaml "$poc_dir")"; then
+        exit 1
+    fi
     while IFS= read -r arg; do
+        [ -n "$arg" ] || continue
         make_args+=("$arg")
-    done < <(_make_args_from_yaml "$poc_dir")
+    done <<< "$manifest_args"
     [ "${#extra_args[@]}" -gt 0 ] && make_args+=("${extra_args[@]}")
 
     make -C "$REPO_ROOT" poc-shielded "${make_args[@]}"
@@ -188,15 +351,20 @@ cmd_debug() {
 
     local poc_yaml="$poc_dir/poc.yaml"
     local name
-    name="$(_yaml_get "$poc_yaml" name)"
+    name="$(_yaml_get_section "$poc_yaml" metadata name)"
 
     echo "[pocctl] Debug: $id – ${name:-(unnamed)}  (GDB on :1234)"
     echo ""
 
     local make_args=()
+    local manifest_args
+    if ! manifest_args="$(_make_args_from_yaml "$poc_dir")"; then
+        exit 1
+    fi
     while IFS= read -r arg; do
+        [ -n "$arg" ] || continue
         make_args+=("$arg")
-    done < <(_make_args_from_yaml "$poc_dir")
+    done <<< "$manifest_args"
     [ "${#extra_args[@]}" -gt 0 ] && make_args+=("${extra_args[@]}")
 
     make -C "$REPO_ROOT" debug "${make_args[@]}"
@@ -213,7 +381,7 @@ cmd_clean() {
     local poc_dir
     poc_dir="$(_find_poc_dir "$id")"
     local arch
-    arch="$(_yaml_get "$poc_dir/poc.yaml" arch)"
+    arch="$(_yaml_get_section "$poc_dir/poc.yaml" target arch)"
     echo "[pocctl] Cleaning artifacts for $id (arch=${arch:-auto})..."
     make -C "$REPO_ROOT" clean ${arch:+ARCH="$arch"}
 }
@@ -224,6 +392,7 @@ pocctl – PoC Lab controller  (Phase 1: Linux kernel via QEMU)
 
 Usage:
   pocctl list                    List all available PoCs (reads poc.yaml)
+  pocctl validate                Validate poc.yaml references and verify patterns
   pocctl run   <id> [K=V ...]   Build kernel + rootfs, inject PoC, launch QEMU
   pocctl shielded <id> [K=V ...] Same as run, with AutoShield artifacts injected
   pocctl debug <id> [K=V ...]   Same as run, but with GDB server on :1234
@@ -238,16 +407,23 @@ Each PoC lives in pocs/<id>/poc.yaml. Fields read by pocctl:
   runtime.user         – run as this user in QEMU (e.g. "user" for LPE PoCs)
   runtime.capabilities – optional caps for the PoC process (e.g. "cap_net_admin")
   runtime.kaslr/smep/smap – security knob overrides
+  verify.type          – output verifier type; currently log
+  verify.success_pattern – extended regex that identifies a successful PoC run
+  verify.fail_pattern    – extended regex that identifies a failed/blocked PoC run
+  metadata.id must match the pocs/<id> directory name, except pocs/template.
 
 Extra KEY=VALUE pairs on the command line override poc.yaml values, e.g.:
   pocctl run smoke ARCH=x86_64
   pocctl run smoke KERNEL_VERSION=5.15.0
   pocctl run smoke KASLR=y SMEP=n
+  pocctl run smoke EXIT_AFTER_POC=1
   pocctl shielded smoke SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield
+  pocctl shielded smoke SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield EXIT_AFTER_POC=1
   pocctl shielded smoke SHIELD_MODE=frida AUTOSHIELD_DIR=../AutoShield
 
 Examples:
   pocctl list
+  pocctl validate
   pocctl run smoke
   pocctl shielded smoke SHIELD_MODE=kernel AUTOSHIELD_DIR=../AutoShield
   pocctl run copyfail
@@ -262,6 +438,7 @@ shift || true
 
 case "$CMD" in
     list)               cmd_list ;;
+    validate)           cmd_validate ;;
     run)
         [ -n "${1:-}" ] || { cmd_help; exit 1; }
         cmd_run "$@"

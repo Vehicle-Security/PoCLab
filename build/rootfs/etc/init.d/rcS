@@ -37,6 +37,11 @@ echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null || true
 SHIELD_MODE=off
 SHIELD_DIR=/root/autoshield
 SHIELD_STATUS=0
+POC_EXIT_AFTER_RUN=0
+
+case "$(cat /proc/cmdline 2>/dev/null)" in
+    *poc.exit=1*) POC_EXIT_AFTER_RUN=1 ;;
+esac
 
 if [ -f /root/autoshield/shield.env ]; then
     . /root/autoshield/shield.env
@@ -52,7 +57,7 @@ prepare_shield() {
             MODULE_ARGS=""
             [ -f "$SHIELD_DIR/module.args" ] && MODULE_ARGS=$(cat "$SHIELD_DIR/module.args")
             FOUND_MODULE=0
-            for module in $(find "$SHIELD_DIR" -type f -name '*.ko'); do
+            for module in $(find "$SHIELD_DIR" -type f -name '*.ko' | sort); do
                 [ -f "$module" ] || continue
                 FOUND_MODULE=1
                 # shellcheck disable=SC2086
@@ -88,6 +93,19 @@ poc_entrypoint() {
     fi
 }
 
+cleanup_shield() {
+    case "$SHIELD_MODE" in
+        kernel)
+            for module in $(find "$SHIELD_DIR" -type f -name '*.ko' | sort -r); do
+                [ -f "$module" ] || continue
+                module_name=$(basename "$module" .ko | tr '-' '_')
+                echo "[*] AutoShield: unloading kernel module $module_name"
+                rmmod "$module_name" 2>/dev/null || true
+            done
+            ;;
+    esac
+}
+
 if ! prepare_shield; then
     SHIELD_STATUS=1
 fi
@@ -114,9 +132,15 @@ if [ "$SHIELD_STATUS" -eq 0 ] && [ -x /root/poc ]; then
     echo "-----------------------------------------------------"
     echo "[*] PoC exited with status $POC_STATUS"
     echo ""
+    cleanup_shield
 elif [ "$SHIELD_STATUS" -ne 0 ]; then
     echo "[-] Skipping PoC because AutoShield setup failed"
     echo ""
+fi
+
+if [ "$POC_EXIT_AFTER_RUN" -eq 1 ]; then
+    echo "[*] poc.exit=1 requested; powering off"
+    echo o > /proc/sysrq-trigger 2>/dev/null || poweroff -f 2>/dev/null || halt -f 2>/dev/null || exit "${POC_STATUS:-0}"
 fi
 
 # Drop into root shell
