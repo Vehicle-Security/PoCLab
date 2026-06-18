@@ -1,0 +1,44 @@
+# AutoShield hook_demo PoCLab integration manifest
+#
+# Runs the hook_demo.ko kernel module (built by AutoShield) inside a QEMU VM.
+# The init script loads the module, triggers a few file opens,
+# then unloads it and prints dmesg to verify hook fired.
+#
+# Usage (from PoCLab root):
+#   ./pocctl run hook-demo
+#   ./pocctl run hook-demo ARCH=arm64
+#   ./pocctl run hook-demo HOOK_BACKEND=FTRACE
+
+metadata:
+  id: hook-demo
+  name: AutoShield Hook Demo
+  description: |
+    Loads hook_demo.ko (built by AutoShield/kernel) which hooks filp_open()
+    and logs every kernel file-open.  Demonstrates kprobe, ftrace, and inline
+    hook backends on x86_64 and arm64.
+
+target:
+  type: linux-kernel
+  arch: x86_64          # override with ARCH=arm64
+  kernel: "6.1.14"
+
+exploit:
+  # poc.c is a minimal userspace driver that exercises the hook
+  source: poc.c
+
+verify:
+  type: log
+  success_pattern: "hook_demo: ready"
+  fail_pattern: "hook_demo: hook install failed"
+
+runtime:
+  kaslr: "false"        # disabled for easier debugging
+  smep: "true"
+  smap: "true"
+  extra_modules: "hook_demo.ko"
+  init_commands: |
+    insmod /root/hook_demo.ko
+    cat /etc/hostname         # triggers a filp_open hook event (benign)
+    cat /proc/version
+    rmmod hook_demo
+    dmesg | grep hook_demo

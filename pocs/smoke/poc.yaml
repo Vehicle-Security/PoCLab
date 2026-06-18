@@ -7,7 +7,8 @@ metadata:
   description: >
     End-to-end pipeline validation. Checks 8 environment properties:
     root uid, uname, /proc/kallsyms (KASLR=n), BPF_MAP_CREATE,
-    CLONE_NEWUSER, debugfs, perf_event_paranoid=-1, printk_ratelimit=0.
+    CLONE_NEWUSER, debugfs, perf_event_paranoid=-1, printk_ratelimit=0,
+    plus the optional AutoShield dummy hook when loaded.
   tags: [smoke, debug]
 
 target:

@@ -56,7 +56,7 @@ cc_supports_flag() {
 
 case "$KERNEL_VERSION" in
     3.*|4.*)
-        SOURCE_PATCH_LEVEL="old-kernel-log2-nan-v2"
+        SOURCE_PATCH_LEVEL="old-kernel-log2-nan-v2-x86-plt32-config-v5"
         for flag in -fno-pie \
                     -fno-stack-protector \
                     -fcf-protection=none \
@@ -142,6 +142,13 @@ apply_old_kernel_compat_patches() {
                     s/\n(\s*)____ilog2_NaN\(\)(\s*)\\/\n$1 0$2\\/g;
                 ' "$log2_h"
             fi
+            local x86_module_c="$KERNEL_SRC/arch/x86/kernel/module.c"
+            if [ -f "$x86_module_c" ] &&
+               grep -q 'case R_X86_64_PC32:' "$x86_module_c" &&
+               ! grep -q 'case R_X86_64_PLT32:' "$x86_module_c"; then
+                echo "[*] Applying old-kernel x86_64 PLT32 module relocation patch ..."
+                perl -0pi -e 's/case R_X86_64_PC32:/case R_X86_64_PLT32:\n\t\tcase R_X86_64_PC32:/' "$x86_module_c"
+            fi
             ;;
     esac
 }
@@ -168,6 +175,30 @@ if [ -n "$POC_CONFIG" ]; then
     esac
     MERGE_CONFIGS="$MERGE_CONFIGS $POC_CONFIG_ABS"
 fi
+
+case "$KERNEL_VERSION" in
+    3.*|4.*)
+        OLD_KERNEL_CONFIG="$KERNEL_BUILD/.poclab-old-kernel.config"
+        cat > "$OLD_KERNEL_CONFIG" <<'EOF'
+# Older kernels in the legacy builder do not support this KASAN mode, and
+# linux-4.4.21's NETFILTER_XT_TARGET_TCPMSS Makefile entry references a
+# missing xt_TCPMSS.c. Heavy debug/KGDB options make 4.x x86_64 bzImages
+# trip during very early QEMU direct boot on current macOS hosts.
+# None of these are required for PoCLab smoke or AutoShield's kprobe module.
+# CONFIG_KASAN is not set
+# CONFIG_NETFILTER_XT_TARGET_TCPMSS is not set
+# CONFIG_RELOCATABLE is not set
+# CONFIG_KALLSYMS_ALL is not set
+# CONFIG_DEBUG_INFO is not set
+# CONFIG_DEBUG_KERNEL is not set
+# CONFIG_DEBUG_FS is not set
+# CONFIG_KGDB is not set
+# CONFIG_KGDB_SERIAL_CONSOLE is not set
+# CONFIG_BPF_JIT is not set
+EOF
+        MERGE_CONFIGS="$MERGE_CONFIGS $OLD_KERNEL_CONFIG"
+        ;;
+esac
 
 # shellcheck disable=SC2086
 "$KERNEL_SRC/scripts/kconfig/merge_config.sh" \

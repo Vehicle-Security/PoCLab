@@ -54,9 +54,44 @@ if [ ! -d "$SRC_DIR" ]; then
     SRC_DIR="$ARTIFACT_DIR"
 fi
 
-mkdir -p "$SHIELD_ROOT/$MODE"
-rm -rf "$SHIELD_ROOT/$MODE"
-mkdir -p "$SHIELD_ROOT/$MODE"
+kernel_module_matches_arch() {
+    local module="$1"
+    local desc
+
+    if ! command -v file >/dev/null 2>&1; then
+        echo "[-] Cannot validate kernel module architecture: 'file' not found" >&2
+        return 1
+    fi
+
+    desc="$(file -b "$module")"
+    case "$ARCH" in
+        x86_64)
+            echo "$desc" | grep -q "x86-64"
+            ;;
+        arm64)
+            echo "$desc" | grep -q "ARM aarch64"
+            ;;
+        *)
+            echo "[-] Unsupported ARCH=$ARCH for kernel module validation" >&2
+            return 1
+            ;;
+    esac
+}
+
+validate_kernel_modules() {
+    local module
+    local desc
+
+    while IFS= read -r module; do
+        desc="$(file -b "$module" 2>/dev/null || echo "unrecognized")"
+        if ! kernel_module_matches_arch "$module"; then
+            echo "[-] Kernel module architecture mismatch for ARCH=$ARCH" >&2
+            echo "    module: $module" >&2
+            echo "    file:   $desc" >&2
+            exit 1
+        fi
+    done < <(find "$SRC_DIR" -maxdepth 2 -type f -name '*.ko' -print)
+}
 
 case "$MODE" in
     kernel)
@@ -65,6 +100,10 @@ case "$MODE" in
             echo "[-] No kernel module (*.ko) found in $SRC_DIR" >&2
             exit 1
         fi
+        validate_kernel_modules
+        mkdir -p "$SHIELD_ROOT"
+        rm -rf "$SHIELD_ROOT/$MODE"
+        mkdir -p "$SHIELD_ROOT/$MODE"
         cp -a "$SRC_DIR"/. "$SHIELD_ROOT/$MODE/"
         ;;
     frida)
@@ -72,6 +111,9 @@ case "$MODE" in
             echo "[-] Frida artifacts need run-frida-hook.sh or agent.js in $SRC_DIR" >&2
             exit 1
         fi
+        mkdir -p "$SHIELD_ROOT"
+        rm -rf "$SHIELD_ROOT/$MODE"
+        mkdir -p "$SHIELD_ROOT/$MODE"
         cp -a "$SRC_DIR"/. "$SHIELD_ROOT/$MODE/"
         if [ ! -f "$SHIELD_ROOT/$MODE/run-frida-hook.sh" ]; then
             cat > "$SHIELD_ROOT/$MODE/run-frida-hook.sh" <<'EOF'

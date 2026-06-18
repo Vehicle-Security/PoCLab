@@ -68,6 +68,11 @@ chmod +x "$POC_BIN"
 echo "[*] Injecting poc binary into rootfs ..."
 cp "$POC_BIN" "$ROOTFS_DIR/root/poc"
 
+# Keep the baseline `make poc` path independent from any previous shielded run.
+# `make poc-shielded` calls this script first, then explicitly injects fresh
+# AutoShield artifacts in the next step.
+rm -rf "$ROOTFS_DIR/root/autoshield"
+
 # If POC_USER is set, the PoC is a privilege-escalation exploit that must start
 # as a non-root user.  Write the username to poc.user and open up permissions so
 # the non-root user can read and execute the binary from /root/.
