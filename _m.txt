@@ -1,1 +1,0 @@
-docs: drop the stray message file from the closing commit
